@@ -196,7 +196,21 @@ function blockedReason(room: Room, day: number) {
   return w ? `${room.name} — ${w.reason}` : room.name;
 }
 
-/** "Northwind Labs" -> "Northwind". Cells are 60px; the suffix never fits. */
+/**
+ * Company names are already short. A 78px cell fits roughly twelve characters,
+ * so the few long ones get a known abbreviation rather than a mid-word ellipsis
+ * ("Tech Mahin…"); anything unlisted falls through to CSS truncation, with the
+ * full name always in the block's tooltip.
+ */
+const ABBREV: Record<string, string> = {
+  "Tech Mahindra": "TechM",
+  "Tower Research": "Tower",
+  "Morgan Stanley": "MorganS",
+  "Goldman Sachs": "Goldman",
+  "Jane Street": "JaneSt",
+  "D. E. Shaw": "DEShaw",
+};
+
 function shortName(name: string) {
-  return name.replace(/ (Labs|Systems|Corp|Tech)$/, "");
+  return ABBREV[name] ?? name;
 }

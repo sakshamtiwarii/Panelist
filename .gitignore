@@ -12,6 +12,7 @@ data/
 # Node / Next.js
 node_modules/
 .next/
+.next-build/
 out/
 npm-debug.log*
 
