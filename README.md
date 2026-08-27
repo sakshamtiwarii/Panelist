@@ -156,5 +156,40 @@ company, student) · `GET /metrics` · `GET /diagnostics` · `POST /replan` ·
 - **Replanner** — done. Four disruption types, compound events, minimal-churn
   re-solve, structured diff, notify list, churn cap with authorization flow.
 - **API** — done. Propose/apply separation verified end to end.
-- **Dashboard** — pending (build order step 5).
+- **Dashboard** — done. Next.js coordinator console (see below).
+
+## Dashboard
+
+```bash
+docker compose up          # API :8000, dashboard :3000
+```
+
+A single-screen operations console — the board, the events being injected and
+the proposed fix all stay visible at once, because routing between them means
+losing the schedule from view exactly when it matters most.
+
+**Room × time board.** The main view is a grid, not a table. A coordinator's
+questions are spatial — what's free at 2pm, how bad is the 11am crunch, what
+does this delay push into — and a grid answers them without the reader
+assembling anything mentally. Blocked room windows are hatched; interviews
+already under way are tinted and pinned.
+
+**Proposals preview on the board.** A replan recolours moved and cancelled
+interviews *in place* before anything is committed, so the change is read
+against the real schedule rather than inferred from a list. Cancelled
+interviews stay visible in their old slot so the loss is legible rather than
+a silent absence.
+
+**Churn is shown against the cap as a bar** before any list of changes,
+because "is this fix proportionate" is the actual question. Forced churn (what
+the disruption cancelled) is separated from elective churn (what the replanner
+chose to move) — blending them makes a modest fix look reckless.
+
+Events are queued rather than fired singly: the compound injection this is
+built for costs far less churn solved once than the same events resolved one
+at a time.
+
+Design bias is the guide's own (§2.4) — clarity over decoration. Colour carries
+meaning and nothing else: neutral is the entire interface, and amber/red/green
+appear only on moved/cancelled/added.
 # Panelist

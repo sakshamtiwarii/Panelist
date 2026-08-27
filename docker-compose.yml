@@ -29,19 +29,22 @@ services:
     depends_on:
       - db
 
-  # Re-enable at build-order step 5 (guide section 7), once dashboard/ exists.
-  # Left commented so `docker compose up` works today for db + api.
-  # dashboard:
-  #   build: ./dashboard
-  #   command: npm run dev
-  #   volumes:
-  #     - ./dashboard:/app
-  #   ports:
-  #     - "3000:3000"
-  #   environment:
-  #     NEXT_PUBLIC_API_URL: http://localhost:8000
-  #   depends_on:
-  #     - api
+  dashboard:
+    build: ./dashboard
+    command: npm run dev
+    volumes:
+      - ./dashboard:/app
+      # Keep the image's node_modules; the bind mount above would otherwise
+      # hide them behind the host directory, which has none in a clean clone.
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    environment:
+      # Resolved in the browser, not in the container, so it points at the
+      # published host port rather than the compose service name.
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    depends_on:
+      - api
 
 volumes:
   panelist_db_data:

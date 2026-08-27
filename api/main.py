@@ -25,6 +25,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -36,6 +37,26 @@ from scheduler.metrics import compute_metrics  # noqa: E402
 from scheduler.model import SchedulingModel  # noqa: E402
 
 app = FastAPI(title="Panelist API")
+
+# The dashboard is served from a different origin (:3000) than the API
+# (:8000), so every browser request is cross-origin and is blocked outright
+# without this — including the preflight OPTIONS, which returns 405 from a
+# bare FastAPI app. Server-side clients (curl, TestClient) never exercise
+# this path, so it stays invisible until a browser actually hits the API.
+DASHBOARD_ORIGINS = [
+    o.strip() for o in os.environ.get(
+        "PANELIST_CORS_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000",
+    ).split(",") if o.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=DASHBOARD_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
+)
 
 DATA_ROOT = os.environ.get("PANELIST_DATA", "./data")
 DEFAULT_DATASET = os.environ.get("PANELIST_DATASET", "primary")
@@ -117,6 +138,34 @@ def health():
         "status": "ok",
         "dataset_loaded": _state["name"],
         "has_schedule": _state["schedule"] is not None,
+    }
+
+
+@app.get("/config")
+def get_config():
+    """Everything the UI needs to render a grid: time model, rooms, companies.
+
+    Served from the API so the dashboard never hardcodes the slot arithmetic —
+    a frontend copy of SLOTS_PER_DAY_RAW that drifts from the backend produces
+    a schedule board that is subtly, silently wrong.
+    """
+    ds = _state["dataset"] or _load(DEFAULT_DATASET)
+    return {
+        "config": ds["config"],
+        "slots_per_day_raw": 32,
+        "day_start_minutes": 9 * 60,
+        "rooms": [
+            {"id": r["id"], "name": r["name"],
+             "blocked_windows": r.get("blocked_windows", [])}
+            for r in ds["rooms"]
+        ],
+        "companies": [
+            {"id": c["id"], "name": c["name"], "tier": c["tier"],
+             "panel_count": c["panel_count"],
+             "interview_minutes": c["interview_minutes"],
+             "shortlist_size": c["shortlist_size"]}
+            for c in ds["companies"]
+        ],
     }
 
 

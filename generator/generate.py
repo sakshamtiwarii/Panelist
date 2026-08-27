@@ -49,12 +49,30 @@ BRANCHES = ["CSE", "IT", "ECE", "EEE", "MECH", "CIVIL", "CHEM"]
 # Companies skew toward hiring from these; used for mild branch affinity.
 TECH_BRANCHES = {"CSE", "IT", "ECE"}
 
+# Ordered by expected campus hiring volume, because tier is assigned by RANK:
+# the first ~10% become the mass recruiters, the next 30% mid-size, the rest
+# niche. That ordering makes the generated structure match how an Indian
+# placement week actually runs — the IT services firms mass-hire on Day 1 with
+# low cutoffs and many panels, while the high-paying product and quant firms
+# take a handful of top-CGPA students later in the week.
+#
+# Real names are used because they carry that structure intuitively: a reader
+# knows what a TCS drive looks like versus a Jane Street one. The data itself
+# — students, shortlists, cutoffs, panel counts — is entirely synthetic.
 COMPANY_NAMES = [
-    "Northwind", "Acme", "Initech", "Umbrella", "Stark", "Wayne", "Cyberdyne",
-    "Tyrell", "Soylent", "Globex", "Hooli", "Pied Piper", "Vehement", "Massive",
-    "Vandelay", "Wonka", "Duff", "Gringotts", "Oceanic", "Abstergo", "Aperture",
-    "Black Mesa", "Weyland", "Virtucon", "Prestige", "Bluth", "Dunder", "Sterling",
-    "Paper St", "Nakatomi", "Zorg", "Omni", "Rekall", "Encom", "Genco",
+    # Mass recruiters: very large shortlists, low cutoffs, many panels.
+    "TCS", "Infosys", "Cognizant", "Wipro",
+    # Mid-size: sizeable drives, moderate cutoffs.
+    "Accenture", "Capgemini", "HCLTech", "Tech Mahindra", "Amazon",
+    "Microsoft", "Oracle", "SAP", "Cisco", "Adobe",
+    # Niche / high-paying: small headcounts, high cutoffs, few panels.
+    "Salesforce", "Qualcomm", "NVIDIA", "Intel", "Google", "Atlassian",
+    "Uber", "Flipkart", "Zomato", "Swiggy", "Razorpay", "PhonePe",
+    "Zoho", "Freshworks", "Anthropic", "OpenAI", "Databricks", "Rubrik",
+    "Jane Street", "D. E. Shaw", "Optiver",
+    # Spare names, used only when --companies exceeds 35.
+    "Tower Research", "Goldman Sachs", "Morgan Stanley", "Palantir",
+    "Stripe", "Figma", "Snowflake", "Confluent", "MongoDB", "Datadog",
 ]
 
 
@@ -151,7 +169,7 @@ def generate_companies(rng, n, days):
 
         companies.append({
             "id": f"C{rank:03d}",
-            "name": f"{name} {['Labs', 'Systems', 'Corp', 'Tech'][rank % 4]}",
+            "name": name,
             "tier": tier,
             "preferred_day": min(day_bias, days - 1),
             "cgpa_cutoff": round(cutoff, 2),
