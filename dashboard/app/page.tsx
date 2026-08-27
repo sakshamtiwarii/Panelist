@@ -4,10 +4,12 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ApiError, api,
   type Appointment, type ConfigResponse, type Diagnostics,
-  type DisruptionEvent, type Metrics, type Proposal, type SolverReport,
+  type DisruptionEvent, type Metrics, type Proposal, type Session,
+  type SolverReport,
 } from "@/lib/api";
 import { makeClock } from "@/lib/time";
 import DiffPanel from "@/components/DiffPanel";
+import LoginScreen from "@/components/LoginScreen";
 import DisruptionPanel from "@/components/DisruptionPanel";
 import MetricsBand from "@/components/MetricsBand";
 import ScheduleGrid, { type ChangeState } from "@/components/ScheduleGrid";
@@ -27,6 +29,8 @@ import ScheduleGrid, { type ChangeState } from "@/components/ScheduleGrid";
  */
 
 export default function Page() {
+  const [session, setSession] = useState<Session | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
   const [cfg, setCfg] = useState<ConfigResponse | null>(null);
   const [appts, setAppts] = useState<Appointment[]>([]);
   const [metrics, setMetrics] = useState<Metrics | null>(null);
@@ -79,7 +83,22 @@ export default function Page() {
     }
   }, []);
 
+  // Resume an existing session before deciding whether to show the login gate,
+  // so a page refresh does not sign the coordinator out mid-disruption.
   useEffect(() => {
+    (async () => {
+      try {
+        setSession(await api.me());
+      } catch {
+        setSession(null);
+      } finally {
+        setAuthChecked(true);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!session) return;
     (async () => {
       try {
         setCfg(await api.config());
@@ -89,7 +108,17 @@ export default function Page() {
         setError(describeError(e));
       }
     })();
-  }, [refresh]);
+  }, [session, refresh]);
+
+  const signOut = async () => {
+    try { await api.logout(); } catch { /* cookie may already be gone */ }
+    setSession(null);
+    setCfg(null);
+    setAppts([]);
+    setMetrics(null);
+    setProposal(null);
+    setQueue([]);
+  };
 
   const solve = async () => {
     setBusy("Solving");
@@ -196,6 +225,14 @@ export default function Page() {
 
   /* ---- render ----------------------------------------------------------- */
 
+  if (!authChecked) {
+    return <div className="bare"><span className="hint">Checking session…</span></div>;
+  }
+
+  if (!session) {
+    return <LoginScreen onSignedIn={setSession} />;
+  }
+
   if (error && !cfg) {
     return (
       <div className="bare">
@@ -285,6 +322,15 @@ export default function Page() {
           </select>
         </label>
 
+        <span className="pill" title={`Signed in as ${session.username}`}>
+          {session.display_name}
+          {session.role === "viewer" && (
+            <span className="urg normal" style={{ marginLeft: 2 }}>READ ONLY</span>
+          )}
+        </span>
+
+        <button className="btn" onClick={signOut}>Sign out</button>
+
         <div className="seg" role="group" aria-label="Theme">
           {(["light", "system", "dark"] as const).map((m) => (
             <button
@@ -298,7 +344,14 @@ export default function Page() {
           ))}
         </div>
 
-        <button className="btn btn-primary" onClick={solve} disabled={!!busy}>
+        <button
+          className="btn btn-primary"
+          onClick={solve}
+          disabled={!!busy || session.role !== "coordinator"}
+          title={session.role !== "coordinator"
+            ? "Building the schedule needs a coordinator account"
+            : undefined}
+        >
           {busy === "Solving"
             ? "Solving…"
             : hasSchedule ? "Rebuild schedule" : "Build schedule"}
@@ -461,6 +514,7 @@ export default function Page() {
         {proposal && clock && (
           <DiffPanel
             proposal={proposal}
+            canApply={session.role === "coordinator"}
             clock={clock}
             companyName={companyName}
             applying={busy === "Applying"}
