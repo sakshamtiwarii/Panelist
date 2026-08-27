@@ -1,0 +1,748 @@
+"""
+Panelist — CP-SAT scheduling model.
+
+Shared model-building logic used by both the initial scheduler and the
+replanner (see PLACEMENT_SCHEDULER_GUIDE.md section 8: "don't duplicate
+solver logic between initial-schedule and replan paths").
+
+FORMULATION NOTE — deliberate deviation from guide section 2.2
+--------------------------------------------------------------
+The guide suggests `assign[interview][room][slot][panel]` booleans. That does
+not scale to the guide's own numbers: 2770 interviews x 20 rooms x 112 slots
+is ~6.2M booleans before panels are indexed at all, and CP-SAT will not build
+that model in reasonable time or memory.
+
+This uses the idiomatic scheduling encoding instead:
+
+  - Two variables per interview: `start` (an IntVar restricted to starts where
+    the interview fits inside one contiguous work block) and `present` (a
+    BoolVar, so an interview may go unscheduled rather than forcing
+    infeasibility). No room or panel decision variables at all.
+  - Rooms are interchangeable, so room capacity is ONE global Cumulative
+    constraint (capacity = room count) rather than per-room booleans. Blocked
+    room windows enter as fixed intervals consuming that capacity.
+  - Panels are interchangeable within a company, so each company's panel limit
+    is ONE Cumulative (capacity = panel_count).
+  - Students get a NoOverlap over their own optional intervals.
+
+Concrete room and panel identities are recovered after the solve by greedy
+interval-graph colouring, which is exact here: for interval graphs greedy
+left-to-right colouring uses exactly `max overlap` colours, and the Cumulative
+constraints guarantee max overlap never exceeds the available count. The
+assignment is verified post-hoc regardless (see `verify_schedule`).
+
+Because `present` is optional and the objective maximises scheduled
+interviews, an oversubscribed instance does not come back INFEASIBLE — it
+comes back with unscheduled interviews, each of which gets an attributed
+reason (see `diagnose_unscheduled`). That is a more specific and more useful
+diagnostic than a solver-level infeasibility certificate.
+"""
+
+from collections import defaultdict
+
+from ortools.sat.python import cp_model
+
+# Slots per day on the raw grid, including the (unusable) lunch band, so that
+# absolute_slot = day * SLOTS_PER_DAY_RAW + slot_in_day stays simple.
+SLOTS_PER_DAY_RAW = 32
+
+
+class SchedulingModel:
+    def __init__(
+        self,
+        companies,
+        students,
+        rooms,
+        config,
+        prior_schedule=None,
+        churn_penalty_weight=0,
+        tier_bonus=2,
+    ):
+        self.companies = companies
+        self.students = students
+        self.rooms = rooms
+        self.config = config
+        self.prior_schedule = prior_schedule or {}
+        self.churn_penalty_weight = churn_penalty_weight
+        self.tier_bonus = tier_bonus
+
+        self.model = cp_model.CpModel()
+        self.constraint_reasons = {}   # constraint_id -> human-readable string
+
+        self.interviews = []           # list of interview dicts
+        self.start = {}                # interview_id -> IntVar
+        self.present = {}              # interview_id -> BoolVar
+        self.intervals = {}            # interview_id -> OptionalIntervalVar
+        self.moved = {}                # interview_id -> BoolVar (replan only)
+
+        self.company_by_id = {c["id"]: c for c in companies}
+        self.student_by_id = {s["id"]: s for s in students}
+        self.valid_starts = self._compute_valid_starts()
+
+    # -- constraint provenance ---------------------------------------------
+
+    def _tag(self, kind, scope, reason):
+        """Record a human-readable reason at construction time (guide s.8),
+        so diagnostics never have to be reverse-engineered after a failure."""
+        cid = f"{kind}:{scope}"
+        self.constraint_reasons[cid] = reason
+        return cid
+
+    # -- time grid ----------------------------------------------------------
+
+    def _work_blocks(self):
+        """Contiguous runs of usable slots within a day (morning, afternoon).
+
+        An interview may not span lunch or a day boundary, so it must fit
+        entirely inside one block.
+        """
+        usable = sorted(self.config["usable_slots_per_day"])
+        blocks, run = [], [usable[0]]
+        for s in usable[1:]:
+            if s == run[-1] + 1:
+                run.append(s)
+            else:
+                blocks.append((run[0], run[-1] + 1))
+                run = [s]
+        blocks.append((run[0], run[-1] + 1))
+        return blocks
+
+    def _compute_valid_starts(self):
+        """Absolute start slots, per duration, where the interview fits."""
+        blocks = self._work_blocks()
+        by_duration = defaultdict(list)
+        durations = {c["duration_slots"] for c in self.companies}
+        for dur in durations:
+            for day in range(self.config["days"]):
+                for lo, hi in blocks:
+                    for s in range(lo, hi - dur + 1):
+                        by_duration[dur].append(day * SLOTS_PER_DAY_RAW + s)
+        return by_duration
+
+    def horizon(self):
+        return self.config["days"] * SLOTS_PER_DAY_RAW
+
+    # -- model construction -------------------------------------------------
+
+    def _build_interviews(self):
+        """One interview per (company, shortlisted student) pair.
+
+        CGPA cutoffs are enforced here rather than as a solver constraint: an
+        interview that would violate a cutoff is never created. Violations are
+        counted so the guarantee is verified rather than assumed.
+        """
+        cutoff_violations = []
+        for c in self.companies:
+            for sid in c["shortlist"]:
+                student = self.student_by_id.get(sid)
+                if student is None:
+                    continue
+                if student["cgpa"] < c["cgpa_cutoff"]:
+                    cutoff_violations.append((c["id"], sid))
+                    continue
+                self.interviews.append({
+                    "id": f"{c['id']}~{sid}",
+                    "company_id": c["id"],
+                    "student_id": sid,
+                    "duration_slots": c["duration_slots"],
+                    "tier": c["tier"],
+                })
+        self._tag(
+            "cgpa_cutoff", "all",
+            "Interviews are only created for students meeting the company's "
+            "CGPA cutoff; this constraint is never violated by construction.",
+        )
+        self.cutoff_violations = cutoff_violations
+
+    def build(self):
+        self._build_interviews()
+        horizon = self.horizon()
+
+        # --- decision variables -------------------------------------------
+        for iv in self.interviews:
+            iid, dur = iv["id"], iv["duration_slots"]
+            domain = cp_model.Domain.FromValues(self.valid_starts[dur])
+            start = self.model.NewIntVarFromDomain(domain, f"start_{iid}")
+            present = self.model.NewBoolVar(f"present_{iid}")
+            end = self.model.NewIntVar(0, horizon, f"end_{iid}")
+            self.model.Add(end == start + dur)
+            interval = self.model.NewOptionalIntervalVar(
+                start, dur, end, present, f"iv_{iid}"
+            )
+            self.start[iid] = start
+            self.present[iid] = present
+            self.intervals[iid] = interval
+
+        self._tag(
+            "duration_fit", "all",
+            "Every interview starts only at a slot where its full duration "
+            "fits inside one contiguous work block (no spanning lunch or "
+            "a day boundary).",
+        )
+
+        # --- students: no double-booking ----------------------------------
+        by_student = defaultdict(list)
+        for iv in self.interviews:
+            by_student[iv["student_id"]].append(iv["id"])
+        for sid, iids in by_student.items():
+            if len(iids) > 1:
+                self.model.AddNoOverlap([self.intervals[i] for i in iids])
+                self._tag(
+                    "student_no_overlap", sid,
+                    f"Student {sid} is on {len(iids)} shortlists; their "
+                    f"interviews may not overlap in time.",
+                )
+
+        # --- companies: panel capacity ------------------------------------
+        by_company = defaultdict(list)
+        for iv in self.interviews:
+            by_company[iv["company_id"]].append(iv["id"])
+        for cid, iids in by_company.items():
+            company = self.company_by_id[cid]
+            panels = company["panel_count"]
+            self.model.AddCumulative(
+                [self.intervals[i] for i in iids], [1] * len(iids), panels
+            )
+            self._tag(
+                "panel_capacity", cid,
+                f"{company['name']} runs at most {panels} interviews "
+                f"concurrently ({panels} panels).",
+            )
+
+        # --- rooms: global capacity, minus blocked windows ----------------
+        room_intervals = [self.intervals[iv["id"]] for iv in self.interviews]
+        demands = [1] * len(room_intervals)
+        for room in self.rooms:
+            for w in room.get("blocked_windows", []):
+                lo = w["day"] * SLOTS_PER_DAY_RAW + w["from_slot"]
+                hi = w["day"] * SLOTS_PER_DAY_RAW + w["to_slot"]
+                room_intervals.append(
+                    self.model.NewIntervalVar(
+                        lo, hi - lo, hi, f"blocked_{room['id']}_{w['day']}"
+                    )
+                )
+                demands.append(1)
+                self._tag(
+                    "room_blocked", f"{room['id']}@d{w['day']}",
+                    f"{room['name']} unavailable on day {w['day']} "
+                    f"slots {w['from_slot']}-{w['to_slot']} ({w['reason']}).",
+                )
+        self.model.AddCumulative(room_intervals, demands, len(self.rooms))
+        self._tag(
+            "room_capacity", "global",
+            f"At most {len(self.rooms)} interviews run concurrently "
+            f"(room count), less any rooms blocked at that time.",
+        )
+
+        # --- objective ------------------------------------------------------
+        self._build_objective()
+        return self
+
+    def _build_objective(self):
+        """Maximise scheduled interviews; penalise churn against a prior plan.
+
+        Maximisation (rather than pure feasibility) is what lets one model
+        serve both a solvable instance and an oversubscribed one: a feasible
+        instance schedules everything, an oversubscribed one returns the best
+        partial schedule plus an attributed shortfall.
+        """
+        terms = []
+        for iv in self.interviews:
+            weight = 10 + self.tier_bonus * (4 - iv["tier"])
+            terms.append(weight * self.present[iv["id"]])
+
+        if self.prior_schedule and self.churn_penalty_weight:
+            for iv in self.interviews:
+                iid = iv["id"]
+                prior = self.prior_schedule.get(iid)
+                if prior is None:
+                    continue
+                same = self.model.NewBoolVar(f"same_{iid}")
+                self.model.Add(
+                    self.start[iid] == prior["start"]
+                ).OnlyEnforceIf(same)
+                self.model.Add(
+                    self.start[iid] != prior["start"]
+                ).OnlyEnforceIf(same.Not())
+                moved = self.model.NewBoolVar(f"moved_{iid}")
+                self.model.Add(moved == 1 - same)
+                self.moved[iid] = moved
+                terms.append(-self.churn_penalty_weight * moved)
+            self._tag(
+                "churn_penalty", "global",
+                f"Each interview moved from its prior time costs "
+                f"{self.churn_penalty_weight}, so the solver prefers the "
+                f"smallest change that resolves the disruption.",
+            )
+
+        self.model.Maximize(sum(terms))
+
+    # -- warm start ---------------------------------------------------------
+
+    def add_warm_start(self):
+        """Seed the solver with the prior schedule (guide section 2.3)."""
+        if not self.prior_schedule:
+            return 0
+        seeded = 0
+        for iid, prior in self.prior_schedule.items():
+            if iid in self.start:
+                self.model.AddHint(self.start[iid], prior["start"])
+                self.model.AddHint(self.present[iid], 1)
+                seeded += 1
+        return seeded
+
+    # -- solving ------------------------------------------------------------
+
+    def solve(self, time_limit_seconds=30, workers=8):
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = time_limit_seconds
+        solver.parameters.num_search_workers = workers
+        status = solver.Solve(self.model)
+        return status, solver
+
+    def status_report(self, status, solver):
+        """Distinguish OPTIMAL / FEASIBLE / INFEASIBLE (guide section 9).
+
+        FEASIBLE is an expected outcome at this scale, not a bug, and must not
+        be reported as if it were OPTIMAL.
+        """
+        name = solver.StatusName(status)
+        if status == cp_model.OPTIMAL:
+            note = "Optimal schedule found."
+        elif status == cp_model.FEASIBLE:
+            note = (
+                f"Valid schedule found, but the solver hit its "
+                f"{solver.parameters.max_time_in_seconds:.0f}s time limit — "
+                f"this schedule is feasible but may not be optimal."
+            )
+        elif status == cp_model.INFEASIBLE:
+            note = (
+                "No valid schedule exists under the current hard constraints. "
+                "This is a genuine model-level infeasibility, not a timeout."
+            )
+        else:
+            note = f"Solver returned {name} without a usable schedule."
+        return {
+            "status": name,
+            "usable": status in (cp_model.OPTIMAL, cp_model.FEASIBLE),
+            "optimal": status == cp_model.OPTIMAL,
+            "note": note,
+            "wall_time_seconds": round(solver.WallTime(), 2),
+        }
+
+    # -- extraction ---------------------------------------------------------
+
+    def extract_schedule(self, solver):
+        """Recover concrete (day, slot, room, panel) assignments.
+
+        Rooms and panels are assigned by greedy interval colouring; the
+        Cumulative constraints guarantee enough of each exist at every instant.
+        """
+        scheduled, unscheduled = [], []
+        for iv in self.interviews:
+            iid = iv["id"]
+            if not solver.Value(self.present[iid]):
+                unscheduled.append(iv)
+                continue
+            abs_start = solver.Value(self.start[iid])
+            scheduled.append({
+                **iv,
+                "start": abs_start,
+                "end": abs_start + iv["duration_slots"],
+                "day": abs_start // SLOTS_PER_DAY_RAW,
+                "slot": abs_start % SLOTS_PER_DAY_RAW,
+            })
+
+        self._assign_panels(scheduled)
+        self._assign_rooms(scheduled)
+        return scheduled, unscheduled
+
+    def _assign_panels(self, scheduled):
+        """Greedy colouring within each company (panels are interchangeable)."""
+        by_company = defaultdict(list)
+        for a in scheduled:
+            by_company[a["company_id"]].append(a)
+        for _cid, items in by_company.items():
+            free_at = []  # panel index -> slot it frees up
+            for a in sorted(items, key=lambda x: x["start"]):
+                placed = False
+                for p, free in enumerate(free_at):
+                    if free <= a["start"]:
+                        free_at[p] = a["end"]
+                        a["panel"] = p
+                        placed = True
+                        break
+                if not placed:
+                    a["panel"] = len(free_at)
+                    free_at.append(a["end"])
+
+    def _blocked_windows(self):
+        blocked = defaultdict(list)
+        for room in self.rooms:
+            for w in room.get("blocked_windows", []):
+                lo = w["day"] * SLOTS_PER_DAY_RAW + w["from_slot"]
+                hi = w["day"] * SLOTS_PER_DAY_RAW + w["to_slot"]
+                blocked[room["id"]].append((lo, hi))
+        return blocked
+
+    def _assign_rooms(self, scheduled):
+        """Assign concrete rooms, greedy first with an exact fallback.
+
+        Greedy interval colouring is exact only while rooms are fully
+        interchangeable. Blocked windows break that: a room free by time may
+        still be unavailable, so greedy can strand an interview that a
+        different assignment would have placed. Greedy stays as the fast path
+        (it succeeds on most instances), and when it strands anything the
+        whole assignment is redone exactly as a colouring-with-forbidden-
+        colours CP-SAT solve. Times are already fixed at this point, so the
+        fallback is small and fast.
+        """
+        if self._greedy_rooms(scheduled):
+            return
+        self._exact_rooms(scheduled)
+
+    def _greedy_rooms(self, scheduled):
+        blocked = self._blocked_windows()
+
+        def is_blocked(rid, lo, hi):
+            return any(not (hi <= b0 or lo >= b1) for b0, b1 in blocked[rid])
+
+        free_at = {r["id"]: 0 for r in self.rooms}
+        ok = True
+        for a in sorted(scheduled, key=lambda x: x["start"]):
+            for room in self.rooms:
+                rid = room["id"]
+                if free_at[rid] <= a["start"] and not is_blocked(
+                    rid, a["start"], a["end"]
+                ):
+                    free_at[rid] = a["end"]
+                    a["room"] = rid
+                    break
+            else:
+                a["room"] = None
+                ok = False
+        return ok
+
+    def _exact_rooms(self, scheduled):
+        """Exact room assignment: one IntVar per interview, domain restricted
+        to rooms free of a blocking window, plus pairwise inequality over
+        interviews that overlap in time."""
+        blocked = self._blocked_windows()
+        room_ids = [r["id"] for r in self.rooms]
+
+        def is_blocked(rid, lo, hi):
+            return any(not (hi <= b0 or lo >= b1) for b0, b1 in blocked[rid])
+
+        m = cp_model.CpModel()
+        var = {}
+        for a in scheduled:
+            allowed = [
+                i for i, rid in enumerate(room_ids)
+                if not is_blocked(rid, a["start"], a["end"])
+            ]
+            var[a["id"]] = m.NewIntVarFromDomain(
+                cp_model.Domain.FromValues(allowed), f"room_{a['id']}"
+            )
+
+        # Sweep line: pair each interview only with those still active.
+        active = []
+        for a in sorted(scheduled, key=lambda x: x["start"]):
+            active = [b for b in active if b["end"] > a["start"]]
+            for b in active:
+                m.Add(var[a["id"]] != var[b["id"]])
+            active.append(a)
+
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = 30
+        solver.parameters.num_search_workers = 8
+        status = solver.Solve(m)
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            for a in scheduled:
+                a["room"] = room_ids[solver.Value(var[a["id"]])]
+        else:
+            # Genuinely unassignable; verify_schedule will surface it.
+            for a in scheduled:
+                a.setdefault("room", None)
+
+    # -- diagnostics --------------------------------------------------------
+
+    def capacity_analysis(self, scheduled, unscheduled):
+        """Structural headline: is this instance short on capacity, and where?
+
+        Per-company attribution is only meaningful once the coordinator knows
+        whether the shortfall is structural (no schedule could place these) or
+        local (a specific window is jammed). This answers that first, and names
+        the specific saturated windows the way guide section 2.2 asks for
+        ("Room capacity exceeded for Day 2, 14:00-16:00 by 6 interviews")
+        rather than repeating "rooms are full" per company.
+        """
+        days = self.config["days"]
+        slots_per_day = self.config["slots_per_day_count"]
+        n_rooms = len(self.rooms)
+        slot_minutes = self.config["slot_minutes"]
+
+        demand_slots = sum(iv["duration_slots"] for iv in self.interviews)
+        capacity_slots = n_rooms * slots_per_day * days
+
+        load = defaultdict(int)
+        for a in scheduled:
+            for t in range(a["start"], a["end"]):
+                load[t] += 1
+        for room in self.rooms:
+            for w in room.get("blocked_windows", []):
+                base = w["day"] * SLOTS_PER_DAY_RAW
+                for t in range(base + w["from_slot"], base + w["to_slot"]):
+                    load[t] += 1
+
+        usable = set(self.config["usable_slots_per_day"])
+
+        # Contiguous runs of fully-saturated slots, as clock windows.
+        saturated = sorted(
+            t for t, n in load.items()
+            if n >= n_rooms and (t % SLOTS_PER_DAY_RAW) in usable
+        )
+        # Runs must break at a day boundary as well as at a gap, or a window
+        # can wrap from one day's afternoon into the next day's morning and
+        # report a nonsense clock range.
+        windows, run = [], []
+        for t in saturated:
+            same_day = run and (t // SLOTS_PER_DAY_RAW) == (
+                run[-1] // SLOTS_PER_DAY_RAW
+            )
+            if same_day and t == run[-1] + 1:
+                run.append(t)
+            else:
+                if run:
+                    windows.append(run)
+                run = [t]
+        if run:
+            windows.append(run)
+
+        def clock_from_slot(slot_in_day):
+            """Clock time for a slot index within a day.
+
+            Takes slot-in-day rather than an absolute slot: an end-exclusive
+            boundary at the last slot of a day would otherwise wrap to 09:00
+            of the following day.
+            """
+            mins = 9 * 60 + slot_in_day * slot_minutes
+            return f"{mins // 60:02d}:{mins % 60:02d}"
+
+        # Contention per window: how many *distinct* unscheduled interviews
+        # could legally have started inside it. Counting every saturated slot
+        # an interview could use would just re-report the global unscheduled
+        # total on every window.
+        window_report = []
+        for w in sorted(windows, key=len, reverse=True)[:6]:
+            day = w[0] // SLOTS_PER_DAY_RAW
+            frm = clock_from_slot(w[0] % SLOTS_PER_DAY_RAW)
+            to = clock_from_slot((w[-1] % SLOTS_PER_DAY_RAW) + 1)
+            window_report.append({
+                "day": day + 1,
+                "from": frm,
+                "to": to,
+                "slots": len(w),
+                "minutes": len(w) * slot_minutes,
+                "text": (
+                    f"Room capacity exceeded on Day {day + 1}, {frm}-{to} "
+                    f"({len(w) * slot_minutes}min): all {n_rooms} rooms "
+                    f"committed for every slot in the window."
+                ),
+            })
+
+        per_day = {}
+        for d in range(days):
+            used = sum(
+                n for t, n in load.items() if t // SLOTS_PER_DAY_RAW == d
+            )
+            per_day[d + 1] = round(100.0 * used / (n_rooms * slots_per_day), 1)
+
+        ratio = demand_slots / capacity_slots if capacity_slots else 0.0
+        structural = ratio > 1.0
+        return {
+            "structural_shortfall": structural,
+            "unscheduled_count": len(unscheduled),
+            "demand_slot_units": demand_slots,
+            "capacity_slot_units": capacity_slots,
+            "load_ratio": round(ratio, 2),
+            "max_schedulable_estimate": (
+                int(len(self.interviews) / ratio) if structural else None
+            ),
+            "headline": (
+                f"Instance is oversubscribed {ratio:.2f}x: {demand_slots} "
+                f"slot-units of interview demand against {capacity_slots} "
+                f"room-slot-units of capacity. No schedule can place all "
+                f"{len(self.interviews)} interviews — the shortfall is "
+                f"structural, not a solver failure."
+                if structural else
+                f"Capacity is sufficient in aggregate (load {ratio:.2f}x); "
+                f"any shortfall is a placement conflict, not a capacity limit."
+            ),
+            "room_utilization_per_day_pct": per_day,
+            "saturated_windows": window_report,
+        }
+
+    def diagnose_unscheduled(self, scheduled, unscheduled):
+        """Attribute each unscheduled interview to a specific saturated resource.
+
+        This is the difference between "couldn't schedule 12 interviews" and
+        "Vandelay Corp: 44 interviews, 1 panel, ceiling is 37 — short by 7"
+        (guide section 5, item 2). Causes come from the constraint tags
+        recorded at construction time, not from post-hoc guesswork.
+        """
+        if not unscheduled:
+            return []
+
+        slots_per_day = self.config["slots_per_day_count"]
+        days = self.config["days"]
+
+        # Occupancy of the shared room pool, per absolute slot.
+        room_load = defaultdict(int)
+        for a in scheduled:
+            for t in range(a["start"], a["end"]):
+                room_load[t] += 1
+
+        # Per-company panel occupancy.
+        panel_load = defaultdict(lambda: defaultdict(int))
+        for a in scheduled:
+            for t in range(a["start"], a["end"]):
+                panel_load[a["company_id"]][t] += 1
+
+        # Per-student busy slots.
+        student_busy = defaultdict(set)
+        for a in scheduled:
+            student_busy[a["student_id"]].update(range(a["start"], a["end"]))
+
+        findings = defaultdict(lambda: {
+            "count": 0, "causes": defaultdict(int), "students": []
+        })
+
+        for iv in unscheduled:
+            cid = iv["company_id"]
+            company = self.company_by_id[cid]
+            dur = iv["duration_slots"]
+            starts = self.valid_starts[dur]
+
+            panel_blocked = room_blocked = student_blocked = 0
+            for s in starts:
+                window = range(s, s + dur)
+                if any(
+                    panel_load[cid][t] >= company["panel_count"] for t in window
+                ):
+                    panel_blocked += 1
+                elif any(room_load[t] >= len(self.rooms) for t in window):
+                    room_blocked += 1
+                elif any(t in student_busy[iv["student_id"]] for t in window):
+                    student_blocked += 1
+
+            total = len(starts)
+            entry = findings[cid]
+            entry["count"] += 1
+            if panel_blocked >= max(room_blocked, student_blocked):
+                entry["causes"]["panel_capacity"] += 1
+            elif room_blocked >= student_blocked:
+                entry["causes"]["room_capacity"] += 1
+            else:
+                entry["causes"]["student_conflict"] += 1
+            if len(entry["students"]) < 3:
+                entry["students"].append(iv["student_id"])
+            entry["_saturation"] = round(
+                100.0 * max(panel_blocked, room_blocked, student_blocked)
+                / max(1, total)
+            )
+
+        # Per-company panel ceiling — an exact, checkable bound.
+        report = []
+        for cid, entry in sorted(
+            findings.items(), key=lambda kv: -kv[1]["count"]
+        ):
+            company = self.company_by_id[cid]
+            ceiling = (
+                company["panel_count"] * slots_per_day * days
+            ) // company["duration_slots"]
+            demand = len(company["shortlist"])
+            dominant = max(entry["causes"].items(), key=lambda kv: kv[1])[0]
+
+            if dominant == "panel_capacity" and demand > ceiling:
+                reason = (
+                    f"{company['name']} needs {demand} interviews but "
+                    f"{company['panel_count']} panel(s) x {slots_per_day} slots "
+                    f"x {days} days / {company['duration_slots']} slots each "
+                    f"= {ceiling} max — short by {demand - ceiling}."
+                )
+            elif dominant == "panel_capacity":
+                reason = (
+                    f"{company['name']}'s {company['panel_count']} panel(s) are "
+                    f"saturated at every remaining slot that fits a "
+                    f"{company['interview_minutes']}min interview."
+                )
+            elif dominant == "room_capacity":
+                reason = (
+                    f"All {len(self.rooms)} rooms are occupied across every "
+                    f"slot where {company['name']} could still place these "
+                    f"interviews."
+                )
+            else:
+                reason = (
+                    f"Students already have interviews filling every slot "
+                    f"compatible with {company['name']} "
+                    f"(e.g. {', '.join(entry['students'])})."
+                )
+
+            report.append({
+                "company_id": cid,
+                "company": company["name"],
+                "unscheduled": entry["count"],
+                "demand": demand,
+                "dominant_cause": dominant,
+                "cause_breakdown": dict(entry["causes"]),
+                "constraint_tag": self.constraint_reasons.get(
+                    f"{'panel_capacity:' + cid if dominant == 'panel_capacity' else 'room_capacity:global'}"
+                ),
+                "reason": reason,
+                "example_students": entry["students"],
+            })
+        return report
+
+    # -- verification -------------------------------------------------------
+
+    def verify_schedule(self, scheduled):
+        """Independently re-check every hard constraint on the output.
+
+        The solver is trusted, but the greedy room/panel colouring is not —
+        this proves the recovered assignment is actually valid.
+        """
+        errors = []
+        seen = defaultdict(list)
+
+        for a in scheduled:
+            if a.get("room") is None:
+                errors.append(
+                    f"{a['id']}: no room could be assigned at slot {a['start']}"
+                )
+            seen["room", a.get("room")].append(a)
+            seen["student", a["student_id"]].append(a)
+            seen["panel", (a["company_id"], a.get("panel"))].append(a)
+
+        for (kind, key), items in seen.items():
+            if key is None:
+                continue
+            items.sort(key=lambda x: x["start"])
+            for a, b in zip(items, items[1:]):
+                if b["start"] < a["end"]:
+                    errors.append(
+                        f"{kind} {key} double-booked: {a['id']} "
+                        f"({a['start']}-{a['end']}) overlaps {b['id']} "
+                        f"({b['start']}-{b['end']})"
+                    )
+
+        # Cutoffs (guaranteed by construction — verified, not assumed).
+        for a in scheduled:
+            company = self.company_by_id[a["company_id"]]
+            student = self.student_by_id[a["student_id"]]
+            if student["cgpa"] < company["cgpa_cutoff"]:
+                errors.append(
+                    f"{a['id']}: cgpa {student['cgpa']} below cutoff "
+                    f"{company['cgpa_cutoff']}"
+                )
+        return errors

@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+ortools
+psycopg2-binary
+pydantic
+python-dotenv

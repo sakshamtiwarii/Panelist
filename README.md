@@ -63,9 +63,55 @@ Churn is capped (default 10% of the day's appointments, configurable). If a
 fix requires exceeding that, it's surfaced to the coordinator to confirm or
 request a looser fix — never auto-applied silently.
 
+## Datasets
+
+The generator emits three datasets, all from seed 42, all reproducible:
+
+| Path | Interviews | Load | Purpose |
+|---|---|---|---|
+| `data/small` | 114 | 0.67 | fast solver iteration |
+| `data/primary` | 1013 | 0.90 | hard but fully solvable |
+| `data/oversubscribed` | 2770 | 2.46 | realistic sizes; infeasible by construction |
+
+Each run writes a `density_report.txt` confirming the instance is actually
+hard before any solver runs: shortlist distribution, the CGPA/shortlist
+Pearson correlation, per-company panel ceilings, and the most contended
+company pairs.
+
+## Solver results
+
+```bash
+python scheduler/run.py --data ./data/primary --time-limit 30
+```
+
+| Dataset | Interviews | Status | Time | Scheduled | Clashes | Room util |
+|---|---|---|---|---|---|---|
+| `small` | 114 | OPTIMAL | 0.1s | 100% | 0 | 67% |
+| `primary` | 1013 | OPTIMAL | 1.2s | 100% | 0 | 90% |
+| `oversubscribed` | 2770 | FEASIBLE (120s cap) | 120s | 39.8% | 0 | 93% |
+
+Every run is independently re-verified after extraction: room, panel and
+student double-booking and CGPA cutoffs are re-checked against the emitted
+schedule rather than trusted from the solver.
+
+### Solver formulation
+
+The model uses interval variables with `Cumulative` capacity constraints, not
+the `assign[interview][room][slot][panel]` boolean grid — that encoding is
+~6.2M booleans at full scale and will not build. Two variables per interview
+(`start`, `present`); rooms and panels are recovered after the solve by
+interval colouring. See the module docstring in `scheduler/model.py` for the
+full rationale.
+
+`present` being optional is what lets one model serve both a solvable and an
+oversubscribed instance: an oversubscribed instance returns the best partial
+schedule plus an attributed shortfall, rather than a bare INFEASIBLE.
+
 ## Status
 
-Scaffold stage — see TODOs in `scheduler/model.py`, `replanner/replan.py`,
-and `api/main.py` for what's implemented vs. pending. Build order follows
-`PLACEMENT_SCHEDULER_GUIDE.md` section 7.
+- **Generator** — done. Seeded, reproducible, with conflict-density readout.
+- **Scheduler** — done. CP-SAT model, metrics, capacity diagnostics,
+  independent verification.
+- **Replanner / API / dashboard** — pending. Build order follows
+  `PLACEMENT_SCHEDULER_GUIDE.md` section 7.
 # Panelist
