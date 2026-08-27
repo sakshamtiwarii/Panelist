@@ -31,6 +31,14 @@ CREATE TABLE IF NOT EXISTS companies (
     PRIMARY KEY (dataset, id)
 );
 
+-- Disruption state that must outlive the replan that caused it: a company
+-- that arrived late really was unavailable, and a panel that walked out is
+-- still gone. Without these a second replan would silently forget the first.
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS
+    unavailable_windows JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS
+    panel_blackouts JSONB NOT NULL DEFAULT '[]'::jsonb;
+
 CREATE TABLE IF NOT EXISTS students (
     dataset TEXT NOT NULL REFERENCES datasets(name) ON DELETE CASCADE,
     id      TEXT NOT NULL,

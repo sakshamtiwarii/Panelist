@@ -146,7 +146,153 @@ def apply_disruption(dataset, disruption, prior_schedule, now_slot=None):
             [],
         )
 
+    # --- roster amendments -------------------------------------------------
+    # Adding or removing a company is not a database write, it is a schedule-
+    # invalidating change: new interviews need slots that are already taken,
+    # and a departing company frees capacity the plan does not know how to use.
+    # Routing them through the same propose/diff/apply path as disruptions
+    # means a roster edit is costed and approved rather than silently leaving
+    # the live schedule wrong.
+
+    if kind == "company_add":
+        return _add_company(dataset, disruption)
+
+    if kind == "company_remove":
+        cid = disruption["company_id"]
+        if cid not in companies:
+            raise DisruptionError(f"unknown company {cid!r}")
+        company = companies[cid]
+        dropped = _drop_interviews(
+            dataset, [f"{cid}~{sid}" for sid in list(company["shortlist"])])
+        dataset["companies"] = [
+            c for c in dataset["companies"] if c["id"] != cid]
+        return (
+            f"{company['name']} withdraws from placement week; "
+            f"{len(dropped)} interview(s) cancelled and its "
+            f"{company['panel_count']} panel(s) released.",
+            dropped,
+        )
+
+    if kind == "shortlist_add":
+        cid, sid = disruption["company_id"], disruption["student_id"]
+        if cid not in companies:
+            raise DisruptionError(f"unknown company {cid!r}")
+        students = {s["id"]: s for s in dataset["students"]}
+        if sid not in students:
+            raise DisruptionError(f"unknown student {sid!r}")
+        company, student = companies[cid], students[sid]
+        # The CGPA cutoff is a business rule, not a preference: an ineligible
+        # student is refused here rather than quietly scheduled.
+        if student["cgpa"] < company["cgpa_cutoff"]:
+            raise DisruptionError(
+                f"{sid} has CGPA {student['cgpa']}, below {company['name']}'s "
+                f"cutoff of {company['cgpa_cutoff']} — cannot be shortlisted."
+            )
+        if sid in company["shortlist"]:
+            raise DisruptionError(
+                f"{sid} is already on {company['name']}'s shortlist.")
+        company["shortlist"].append(sid)
+        company["shortlist_size"] = len(company["shortlist"])
+        student.setdefault("shortlisted_by", []).append(cid)
+        return (
+            f"{sid} added to {company['name']}'s shortlist "
+            f"(CGPA {student['cgpa']} vs cutoff {company['cgpa_cutoff']}).",
+            [],
+        )
+
+    if kind == "shortlist_remove":
+        cid, sid = disruption["company_id"], disruption["student_id"]
+        if cid not in companies:
+            raise DisruptionError(f"unknown company {cid!r}")
+        if sid not in companies[cid]["shortlist"]:
+            raise DisruptionError(
+                f"{sid} is not on {companies[cid]['name']}'s shortlist.")
+        dropped = _drop_interviews(dataset, [f"{cid}~{sid}"])
+        return (
+            f"{sid} removed from {companies[cid]['name']}'s shortlist.",
+            dropped,
+        )
+
     raise DisruptionError(f"unknown disruption type {kind!r}")
+
+
+def _add_company(dataset, spec):
+    """Register a company that arrived after the dataset was generated.
+
+    The shortlist may be given explicitly, or a size may be given and the
+    eligible students picked by CGPA — which is what a late registration
+    actually looks like: "we want twenty, cutoff 8.5".
+    """
+    companies = {c["id"]: c for c in dataset["companies"]}
+    students = {s["id"]: s for s in dataset["students"]}
+    slot_minutes = dataset["config"]["slot_minutes"]
+
+    cid = spec.get("company_id")
+    if not cid:
+        used = {c["id"] for c in dataset["companies"]}
+        n = 0
+        while f"C{n:03d}" in used:
+            n += 1
+        cid = f"C{n:03d}"
+    if cid in companies:
+        raise DisruptionError(f"company {cid!r} already exists")
+
+    name = (spec.get("name") or "").strip()
+    if not name:
+        raise DisruptionError("a company needs a name")
+
+    cutoff = float(spec.get("cgpa_cutoff", 7.0))
+    minutes = int(spec.get("interview_minutes", 30))
+    if minutes % slot_minutes:
+        raise DisruptionError(
+            f"interview length must be a multiple of {slot_minutes} minutes")
+
+    eligible = sorted(
+        (s for s in dataset["students"] if s["cgpa"] >= cutoff),
+        key=lambda s: -s["cgpa"],
+    )
+    explicit = spec.get("shortlist")
+    if explicit:
+        missing = [s for s in explicit if s not in students]
+        if missing:
+            raise DisruptionError(f"unknown students: {', '.join(missing[:5])}")
+        below = [s for s in explicit if students[s]["cgpa"] < cutoff]
+        if below:
+            raise DisruptionError(
+                f"{len(below)} of the named students are below the "
+                f"{cutoff} cutoff (e.g. {below[0]})")
+        shortlist = list(explicit)
+    else:
+        size = int(spec.get("shortlist_size", 20))
+        if size > len(eligible):
+            raise DisruptionError(
+                f"only {len(eligible)} students meet a {cutoff} cutoff, "
+                f"but {size} were requested")
+        shortlist = [s["id"] for s in eligible[:size]]
+
+    company = {
+        "id": cid,
+        "name": name,
+        "tier": int(spec.get("tier", 3)),
+        "preferred_day": spec.get("day", 0),
+        "cgpa_cutoff": round(cutoff, 2),
+        "panel_count": int(spec.get("panel_count", 2)),
+        "interview_minutes": minutes,
+        "duration_slots": minutes // slot_minutes,
+        "tech_focused": bool(spec.get("tech_focused", True)),
+        "shortlist_size": len(shortlist),
+        "shortlist": shortlist,
+    }
+    dataset["companies"].append(company)
+    for sid in shortlist:
+        students[sid].setdefault("shortlisted_by", []).append(cid)
+
+    return (
+        f"{name} registered late as {cid}: {len(shortlist)} students "
+        f"shortlisted at CGPA {cutoff}+, {company['panel_count']} panel(s), "
+        f"{minutes}min interviews.",
+        [],
+    )
 
 
 def _withdraw_student(dataset, prior_schedule, sid, scope, from_slot,
@@ -271,6 +417,9 @@ def replan(
         disruptions = [disruptions]
 
     prior_schedule = {a["id"]: a for a in prior_scheduled}
+    # Captured before amendments so a company removed by this replan can still
+    # be named in the notifications about its own cancellation.
+    original_names = {c["id"]: c["name"] for c in dataset["companies"]}
     working = copy.deepcopy(dataset)
 
     applied, forced_removed = [], set()
@@ -337,7 +486,7 @@ def replan(
 
     proposal = _build_proposal(
         working, prior_scheduled, attempt, applied, churn_cap_pct,
-        forced_removed,
+        forced_removed, original_names,
     )
 
     # Over the cap: look for a lower-churn alternative rather than either
@@ -350,7 +499,7 @@ def replan(
         if looser is not None:
             alt = _build_proposal(
                 working, prior_scheduled, looser, applied, churn_cap_pct,
-                forced_removed,
+                forced_removed, original_names,
             )
             base = proposal["diff"]["elective_churn_count"]
             reduced = alt["diff"]["elective_churn_count"]
@@ -462,7 +611,7 @@ def _solve_attempt(working, prior_schedule, locked, churn_weight, time_limit,
 
 
 def _build_proposal(working, prior_scheduled, attempt, applied, churn_cap_pct,
-                    forced_removed=()):
+                    forced_removed=(), original_names=None):
     diff = compute_diff(prior_scheduled, attempt["scheduled"], forced_removed)
     errors = attempt["model"].verify_schedule(attempt["scheduled"])
     # The cap governs ELECTIVE churn only. Cancelling a withdrawn student's
@@ -474,6 +623,10 @@ def _build_proposal(working, prior_scheduled, attempt, applied, churn_cap_pct,
     return {
         "ok": True,
         "label": "proposal",
+        # The amended problem input travels WITH the proposal. Applying a
+        # roster change that persisted only the schedule would leave
+        # appointments pointing at a company the dataset no longer contains.
+        "dataset": working,
         "disruptions_applied": applied,
         "solver": attempt["report"],
         "churn_weight": attempt["churn_weight"],
@@ -481,7 +634,8 @@ def _build_proposal(working, prior_scheduled, attempt, applied, churn_cap_pct,
         "unscheduled": [u["id"] for u in attempt["unscheduled"]],
         "diff": diff,
         "notify": compute_notify_list(diff, working, prior_scheduled,
-                                      attempt["scheduled"]),
+                                      attempt["scheduled"],
+                                      extra_names=original_names),
         "verification_errors": errors,
         "churn_cap_pct": churn_cap_pct,
         "cap_exceeded": cap_exceeded,
@@ -564,15 +718,23 @@ def compute_diff(old_schedule, new_schedule, forced_removed=()):
     }
 
 
-def compute_notify_list(diff, dataset, old_schedule, new_schedule):
+def compute_notify_list(diff, dataset, old_schedule, new_schedule,
+                        extra_names=None):
     """Who needs to be told what — generated straight from the diff.
 
     Explicitly requested by the spec and easy to forget (guide section 5,
     item 5). One entry per person, not per changed interview, so a student
     with three moved interviews gets one message rather than three.
     """
-    companies = {c["id"]: c for c in dataset["companies"]}
+    # A withdrawn company is gone from the amended dataset, but its cancelled
+    # interviews still need naming in the messages that go out — so fall back
+    # to the pre-amendment names before the bare id.
+    names = dict(extra_names or {})
+    names.update({c["id"]: c["name"] for c in dataset["companies"]})
     slot_minutes = dataset["config"]["slot_minutes"]
+
+    def company_name(cid):
+        return names.get(cid, cid)
 
     def clock(rec):
         mins = 9 * 60 + rec["slot"] * slot_minutes
@@ -589,16 +751,16 @@ def compute_notify_list(diff, dataset, old_schedule, new_schedule):
             entry["urgency"] = "high"
 
     for item in diff["removed_detail"]:
-        cname = companies[item["company_id"]]["name"]
+        cname = company_name(item["company_id"])
         note(item["student_id"], "high",
              f"CANCELLED: {cname} interview at {clock(item['from'])}.")
     for item in diff["moved_detail"]:
-        cname = companies[item["company_id"]]["name"]
+        cname = company_name(item["company_id"])
         note(item["student_id"], "high",
              f"MOVED: {cname} interview {clock(item['from'])} "
              f"-> {clock(item['to'])} ({item['to']['room']}).")
     for item in diff["added_detail"]:
-        cname = companies[item["company_id"]]["name"]
+        cname = company_name(item["company_id"])
         note(item["student_id"], "normal",
              f"NEW: {cname} interview at {clock(item['to'])} "
              f"({item['to']['room']}).")
@@ -609,7 +771,7 @@ def compute_notify_list(diff, dataset, old_schedule, new_schedule):
             c = company_counts.setdefault(
                 item["company_id"],
                 {"company_id": item["company_id"],
-                 "company": companies[item["company_id"]]["name"],
+                 "company": company_name(item["company_id"]),
                  "cancelled": 0, "moved": 0, "added": 0},
             )
             c[{"removed_detail": "cancelled",

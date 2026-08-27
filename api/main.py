@@ -12,6 +12,9 @@ shapes responses.
     GET  /diagnostics    -> why interviews are unscheduled
     GET  /affected       -> who a disruption touches (SQL impact query)
     GET  /schedule/versions -> every schedule version, newest first
+    POST /roster/companies  -> propose adding a company (returns a diff)
+    DELETE /roster/companies/{id} -> propose removing one
+    POST/DELETE /roster/shortlist -> propose a single shortlist change
     POST /replan         -> propose a fix for a disruption; returns a diff
     POST /replan/apply   -> commit a previously-returned proposal
     GET  /replan/history -> audit trail of applied replans
@@ -113,7 +116,9 @@ class ScheduleRequest(BaseModel):
 
 class Disruption(BaseModel):
     type: str = Field(..., description="company_late | panel_drop | "
-                                       "student_withdraw | room_unavailable")
+                                       "student_withdraw | room_unavailable | "
+                                       "company_add | company_remove | "
+                                       "shortlist_add | shortlist_remove")
     company_id: Optional[str] = None
     student_id: Optional[str] = None
     room_id: Optional[str] = None
@@ -124,6 +129,34 @@ class Disruption(BaseModel):
     from_slot: Optional[int] = None
     to_slot: Optional[int] = None
     reason: Optional[str] = None
+    # roster amendment fields
+    name: Optional[str] = None
+    tier: Optional[int] = None
+    cgpa_cutoff: Optional[float] = None
+    panel_count: Optional[int] = None
+    interview_minutes: Optional[int] = None
+    shortlist: Optional[List[str]] = None
+    shortlist_size: Optional[int] = None
+
+
+class NewCompany(BaseModel):
+    name: str
+    cgpa_cutoff: float = 7.0
+    panel_count: int = 2
+    interview_minutes: int = 30
+    tier: int = 3
+    company_id: Optional[str] = None
+    shortlist: Optional[List[str]] = None
+    shortlist_size: int = 20
+    churn_cap_pct: float = 10.0
+    time_limit_seconds: float = 60.0
+
+
+class ShortlistEntry(BaseModel):
+    company_id: str
+    student_id: str
+    churn_cap_pct: float = 10.0
+    time_limit_seconds: float = 45.0
 
 
 class ReplanRequest(BaseModel):
@@ -424,17 +457,15 @@ def replan_history(limit: int = 20, _=Depends(current_user)):
     return {"events": store.replan_history(_state["name"], limit=limit)}
 
 
-@app.post("/replan")
-def propose_replan(req: ReplanRequest, _=Depends(current_user)):
-    """Propose a fix. Never mutates the live schedule."""
+def _propose(events, churn_cap_pct, time_limit_seconds, now_slot=None):
+    """Build a proposal from any list of events. Mutates nothing."""
     ds, schedule = _require_schedule()
-    events = [d.model_dump(exclude_none=True) for d in req.disruptions]
     try:
         proposal = replan(
             ds, schedule, events,
-            churn_cap_pct=req.churn_cap_pct,
-            time_limit_seconds=req.time_limit_seconds,
-            now_slot=req.now_slot,
+            churn_cap_pct=churn_cap_pct,
+            time_limit_seconds=time_limit_seconds,
+            now_slot=now_slot,
         )
     except DisruptionError as e:
         raise HTTPException(400, str(e))
@@ -445,16 +476,13 @@ def propose_replan(req: ReplanRequest, _=Depends(current_user)):
     proposal["_events"] = events
     pid = str(uuid.uuid4())
     _proposals[pid] = proposal
-    # The full schedule is large and the coordinator reviews the diff, not the
-    # 1000-row board; it stays server-side until the proposal is applied.
     return {
         "proposal_id": pid,
         "ok": True,
         "label": proposal["label"],
         "disruptions_applied": proposal["disruptions_applied"],
         "solver": proposal["solver"],
-        "diff": {k: v for k, v in proposal["diff"].items()
-                 if k != "reseated"},
+        "diff": {k: v for k, v in proposal["diff"].items() if k != "reseated"},
         "notify": proposal["notify"],
         "churn_cap_pct": proposal["churn_cap_pct"],
         "cap_exceeded": proposal["cap_exceeded"],
@@ -463,6 +491,60 @@ def propose_replan(req: ReplanRequest, _=Depends(current_user)):
         "verification_errors": proposal["verification_errors"],
         "has_alternative": "alternative" in proposal,
     }
+
+
+# --- roster amendments -----------------------------------------------------
+#
+# These return a PROPOSAL, not a committed change. Adding a company means its
+# interviews need slots that are already taken; removing one frees capacity the
+# plan cannot use. Writing either straight to the database would leave the live
+# schedule wrong while every metric still read zero clashes, because nothing
+# re-checked it. Committing goes through POST /replan/apply like any other fix.
+
+@app.post("/roster/companies")
+def add_company(req: NewCompany, _=Depends(current_user)):
+    """Propose registering a company that arrived after the dataset was built."""
+    event = {"type": "company_add", **req.model_dump(
+        exclude_none=True, exclude={"churn_cap_pct", "time_limit_seconds"})}
+    return _propose([event], req.churn_cap_pct, req.time_limit_seconds)
+
+
+@app.delete("/roster/companies/{company_id}")
+def remove_company(company_id: str, churn_cap_pct: float = 10.0,
+                   time_limit_seconds: float = 60.0,
+                   _=Depends(current_user)):
+    """Propose withdrawing a company and cancelling its interviews."""
+    return _propose([{"type": "company_remove", "company_id": company_id}],
+                    churn_cap_pct, time_limit_seconds)
+
+
+@app.post("/roster/shortlist")
+def add_shortlist_entry(req: ShortlistEntry, _=Depends(current_user)):
+    """Propose adding one student to one company's shortlist."""
+    return _propose(
+        [{"type": "shortlist_add", "company_id": req.company_id,
+          "student_id": req.student_id}],
+        req.churn_cap_pct, req.time_limit_seconds)
+
+
+@app.delete("/roster/shortlist")
+def remove_shortlist_entry(company_id: str, student_id: str,
+                           churn_cap_pct: float = 10.0,
+                           time_limit_seconds: float = 45.0,
+                           _=Depends(current_user)):
+    """Propose taking one student off one company's shortlist."""
+    return _propose(
+        [{"type": "shortlist_remove", "company_id": company_id,
+          "student_id": student_id}],
+        churn_cap_pct, time_limit_seconds)
+
+
+@app.post("/replan")
+def propose_replan(req: ReplanRequest, _=Depends(current_user)):
+    """Propose a fix. Never mutates the live schedule."""
+    events = [d.model_dump(exclude_none=True) for d in req.disruptions]
+    return _propose(events, req.churn_cap_pct, req.time_limit_seconds,
+                    req.now_slot)
 
 
 @app.post("/replan/apply")
@@ -476,8 +558,15 @@ def commit_replan(req: ApplyRequest, _=Depends(require_coordinator)):
     except ValueError as e:
         raise HTTPException(409, str(e))
 
-    ds = _state["dataset"]
     name = _state["name"]
+    # Persist the amended roster BEFORE the schedule. A proposal that added or
+    # removed a company changes the problem input, and saving only the schedule
+    # leaves appointments referencing a company the dataset no longer has.
+    ds = proposal.get("dataset") or _state["dataset"]
+    if proposal.get("dataset"):
+        store.amend_dataset(name, ds)
+        _state["dataset"] = ds
+
     metrics = compute_metrics(
         schedule, [{"id": i} for i in proposal["unscheduled"]],
         ds["students"], ds["rooms"], ds["config"],

@@ -17,27 +17,43 @@ reports which store is active, so the degradation is visible rather than silent.
 import json
 import os
 import pathlib
+import time
 
 SCHEMA_PATH = pathlib.Path(__file__).with_name("schema.sql")
 
 
-def open_store(url=None, quiet=False):
-    """Return a Postgres-backed store, or an in-memory one if unavailable."""
+def open_store(url=None, quiet=False, attempts=10, delay=1.5):
+    """Return a Postgres-backed store, or an in-memory one if unavailable.
+
+    Retries before giving up: a database that is merely still booting is the
+    common case on a cold start, and falling back to memory there would drop
+    persistence for the whole run while every request still succeeded.
+    """
     url = url or os.environ.get("DATABASE_URL")
     if not url:
         if not quiet:
             print("[store] DATABASE_URL unset — using in-memory store")
         return MemoryStore()
-    try:
-        store = PostgresStore(url)
-        store.init_schema()
-        if not quiet:
-            print(f"[store] connected to Postgres ({store.describe()})")
-        return store
-    except Exception as e:  # driver missing, server down, bad credentials
-        if not quiet:
-            print(f"[store] Postgres unavailable ({e}) — using in-memory store")
-        return MemoryStore()
+
+    last = None
+    for attempt in range(1, attempts + 1):
+        try:
+            store = PostgresStore(url)
+            store.init_schema()
+            if not quiet:
+                print(f"[store] connected to Postgres ({store.describe()})")
+            return store
+        except Exception as e:  # driver missing, server down, bad credentials
+            last = e
+            if attempt < attempts:
+                if not quiet and attempt == 1:
+                    print(f"[store] Postgres not ready, retrying for "
+                          f"{attempts * delay:.0f}s…")
+                time.sleep(delay)
+    if not quiet:
+        print(f"[store] Postgres unavailable after {attempts} attempts "
+              f"({last}) — using in-memory store")
+    return MemoryStore()
 
 
 class MemoryStore:
@@ -63,6 +79,9 @@ class MemoryStore:
 
     def get_dataset(self, name):
         return self._datasets.get(name)
+
+    def amend_dataset(self, name, ds):
+        self._datasets[name] = ds
 
     # -- schedules -------------------------------------------------------
     def put_schedule(self, dataset, scheduled, unscheduled, report, metrics,
@@ -230,13 +249,17 @@ class PostgresStore:
             cur.execute(
                 """SELECT id, name, tier, cgpa_cutoff, panel_count,
                           interview_minutes, duration_slots, preferred_day,
-                          shortlist_size
+                          shortlist_size, unavailable_windows, panel_blackouts
                    FROM companies WHERE dataset = %s ORDER BY id""", (name,))
             companies = [{
                 "id": r[0], "name": r[1], "tier": r[2], "cgpa_cutoff": r[3],
                 "panel_count": r[4], "interview_minutes": r[5],
                 "duration_slots": r[6], "preferred_day": r[7],
-                "shortlist_size": r[8], "shortlist": [],
+                "shortlist_size": r[8],
+                # Tuples, not lists: the model tests these as (from, to) pairs.
+                "unavailable_windows": [tuple(w) for w in (r[9] or [])],
+                "panel_blackouts": [tuple(w) for w in (r[10] or [])],
+                "shortlist": [],
             } for r in cur.fetchall()]
             by_id = {c["id"]: c for c in companies}
 
@@ -268,6 +291,63 @@ class PostgresStore:
             "meta": {"seed": seed}, "config": config,
             "companies": companies, "students": students, "rooms": rooms,
         }
+
+    def amend_dataset(self, name, ds):
+        """Apply a roster change WITHOUT cascading away schedule history.
+
+        `put_dataset` deletes and reinserts, which is right when the input data
+        is genuinely replaced — but a roster amendment must keep prior schedule
+        versions and the replan audit trail intact, so this upserts instead.
+        Historical appointments keep their rows because `appointments.company_id`
+        is deliberately not a foreign key: a past schedule should still record
+        what it scheduled, even for a company that has since pulled out.
+        """
+        companies = ds["companies"]
+        keep = [c["id"] for c in companies]
+        with self.conn, self.conn.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO companies (dataset, id, name, tier, cgpa_cutoff,
+                       panel_count, interview_minutes, duration_slots,
+                       preferred_day, shortlist_size, unavailable_windows,
+                       panel_blackouts)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (dataset, id) DO UPDATE SET
+                       name = EXCLUDED.name,
+                       tier = EXCLUDED.tier,
+                       cgpa_cutoff = EXCLUDED.cgpa_cutoff,
+                       panel_count = EXCLUDED.panel_count,
+                       interview_minutes = EXCLUDED.interview_minutes,
+                       duration_slots = EXCLUDED.duration_slots,
+                       preferred_day = EXCLUDED.preferred_day,
+                       shortlist_size = EXCLUDED.shortlist_size,
+                       unavailable_windows = EXCLUDED.unavailable_windows,
+                       panel_blackouts = EXCLUDED.panel_blackouts""",
+                [(name, c["id"], c["name"], c["tier"], c["cgpa_cutoff"],
+                  c["panel_count"], c["interview_minutes"], c["duration_slots"],
+                  c.get("preferred_day"), c["shortlist_size"],
+                  json.dumps(c.get("unavailable_windows", [])),
+                  json.dumps(c.get("panel_blackouts", [])))
+                 for c in companies])
+
+            if keep:
+                cur.execute(
+                    "DELETE FROM companies WHERE dataset = %s AND NOT (id = ANY(%s))",
+                    (name, keep))
+
+            # Shortlists are replaced wholesale: they are small, and diffing
+            # them would be more code than rewriting them.
+            cur.execute("DELETE FROM shortlists WHERE dataset = %s", (name,))
+            cur.executemany(
+                "INSERT INTO shortlists (dataset, company_id, student_id) VALUES (%s,%s,%s)",
+                [(name, c["id"], sid) for c in companies for sid in c["shortlist"]])
+
+            cur.executemany(
+                """INSERT INTO rooms (dataset, id, name, blocked_windows)
+                   VALUES (%s,%s,%s,%s)
+                   ON CONFLICT (dataset, id) DO UPDATE SET
+                       blocked_windows = EXCLUDED.blocked_windows""",
+                [(name, r["id"], r["name"], json.dumps(r.get("blocked_windows", [])))
+                 for r in ds["rooms"]])
 
     # -- schedules -------------------------------------------------------
     def put_schedule(self, dataset, scheduled, unscheduled, report, metrics,

@@ -58,6 +58,41 @@ Set `PANELIST_SECRET_KEY` in any real deployment. Unset, the API generates a
 per-process key and says so — sessions then die on restart, which is deliberate:
 an unset secret should be noticed, not silently insecure.
 
+## Roster changes
+
+A coordinator can register a late company, withdraw one, or edit a single
+shortlist entry:
+
+```
+POST   /roster/companies              add a company
+DELETE /roster/companies/{id}         withdraw one
+POST   /roster/shortlist              add one student to one shortlist
+DELETE /roster/shortlist              remove one
+```
+
+**These return a proposal, not a committed change** — they go through exactly
+the same propose → diff → apply path as a disruption, and commit via
+`POST /replan/apply`.
+
+That is the whole point. Adding a company means its interviews need slots that
+are already taken; removing one frees capacity the plan cannot use; adding a
+shortlist entry can create a clash. A direct database write would leave the
+live schedule wrong while every metric still read zero clashes, because nothing
+re-checked it. Routing roster edits through the replanner means each one is
+costed, capped and approved like any other change:
+
+```
+Jane Street Capital registered late as C035: 12 students shortlisted
+at CGPA 8.8+, 2 panel(s), 45min interviews.
+  cost 18 moved · 12 placed · within 10% cap · verify PASS
+```
+
+CGPA cutoffs are enforced here as a business rule, not a preference — an
+ineligible student is refused with the reason, never quietly scheduled.
+
+There is deliberately no student create/delete: the cohort is fixed by the
+university, so it is not an operation a placement coordinator has.
+
 ## Persistence
 
 Schedule state lives in Postgres (`store/schema.sql`). Two decisions are worth
@@ -236,6 +271,8 @@ near-identical choices as though they were a decision.
 ## API
 
 `POST /auth/login` · `POST /auth/logout` · `GET /auth/me` ·
+`POST /roster/companies` · `DELETE /roster/companies/{id}` ·
+`POST|DELETE /roster/shortlist` ·
 `POST /generate` · `POST /schedule` · `GET /schedule` (filter by day, room,
 company, student) · `GET /metrics` · `GET /diagnostics` · `GET /affected` ·
 `GET /schedule/versions` · `POST /replan` · `POST /replan/apply` ·
@@ -253,6 +290,8 @@ company, student) · `GET /metrics` · `GET /diagnostics` · `GET /affected` ·
   and replan audit trail, with an in-memory fallback.
 - **Auth** — done. Scrypt password hashing, signed httpOnly session cookies,
   coordinator/viewer roles gating mutation.
+- **Roster editing** — done. Add/withdraw a company, edit shortlist entries,
+  all costed through the replanner rather than written directly.
 - **Dashboard** — done. Next.js coordinator console (see below).
 
 ## Dashboard

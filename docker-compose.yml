@@ -16,6 +16,15 @@ services:
       - "${PANELIST_DB_PORT:-55432}:5432"
     volumes:
       - panelist_db_data:/var/lib/postgresql/data
+    healthcheck:
+      # depends_on alone only waits for the CONTAINER to start, not for
+      # Postgres to accept connections — the API wins that race on a cold
+      # start and silently falls back to its in-memory store.
+      test: ["CMD-SHELL", "pg_isready -U panelist -d panelist"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
 
   api:
     build:
@@ -47,7 +56,8 @@ services:
       PANELIST_CORS_ORIGINS: >-
         http://localhost:${PANELIST_WEB_PORT:-3000},http://127.0.0.1:${PANELIST_WEB_PORT:-3000}
     depends_on:
-      - db
+      db:
+        condition: service_healthy
 
   dashboard:
     build: ./dashboard
