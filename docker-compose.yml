@@ -6,7 +6,14 @@ services:
       POSTGRES_PASSWORD: panelist
       POSTGRES_DB: panelist
     ports:
-      - "5432:5432"
+      # Published high and overridable because developer machines routinely
+      # already run Postgres — 5432 and 5433 are both commonly taken, and
+      # Docker publishes on 0.0.0.0, so it collides with any instance bound to
+      # all interfaces even when localhost-only tools report the port free.
+      # The API reaches the database as db:5432 on the compose network
+      # regardless; this mapping exists only for host tooling like psql.
+      # Override with: PANELIST_DB_PORT=5599 docker compose up
+      - "${PANELIST_DB_PORT:-55432}:5432"
     volumes:
       - panelist_db_data:/var/lib/postgresql/data
 
@@ -22,10 +29,23 @@ services:
       - ./scheduler:/app/scheduler
       - ./replanner:/app/replanner
       - ./generator:/app/generator
+      - ./store:/app/store
+      # Datasets are generated artefacts and gitignored, so a fresh clone has
+      # none. Mounting the host directory means POST /generate writes somewhere
+      # that survives the container, and an existing dataset is picked up
+      # without rebuilding the image.
+      - ./data:/app/data
     ports:
-      - "8000:8000"
+      - "${PANELIST_API_PORT:-8000}:8000"
     environment:
       DATABASE_URL: postgresql://panelist:panelist@db:5432/panelist
+      # The browser's origin is the published host port, not the container's.
+      # Signing key for session cookies. The compose default is fine for a
+      # local demo; a real deployment must set its own, or every restart
+      # invalidates all sessions.
+      PANELIST_SECRET_KEY: ${PANELIST_SECRET_KEY:-panelist-local-demo-key}
+      PANELIST_CORS_ORIGINS: >-
+        http://localhost:${PANELIST_WEB_PORT:-3000},http://127.0.0.1:${PANELIST_WEB_PORT:-3000}
     depends_on:
       - db
 
@@ -38,11 +58,15 @@ services:
       # hide them behind the host directory, which has none in a clean clone.
       - /app/node_modules
     ports:
-      - "3000:3000"
+      # Every published port is overridable: dev machines routinely already run
+      # something on 3000/8000/5432. Defaults match the documented URLs, so a
+      # clean machine needs no environment at all.
+      # e.g. PANELIST_WEB_PORT=3001 docker compose up
+      - "${PANELIST_WEB_PORT:-3000}:3000"
     environment:
       # Resolved in the browser, not in the container, so it points at the
       # published host port rather than the compose service name.
-      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_API_URL: http://localhost:${PANELIST_API_PORT:-8000}
     depends_on:
       - api
 

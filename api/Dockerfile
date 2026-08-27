@@ -12,5 +12,6 @@ COPY api/ .
 COPY scheduler/ ./scheduler/
 COPY replanner/ ./replanner/
 COPY generator/ ./generator/
+COPY store/ ./store/
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

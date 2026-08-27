@@ -4,6 +4,9 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     ...init,
     headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
+    // The session is an httpOnly cookie, so it only travels when credentials
+    // are explicitly included on a cross-origin request.
+    credentials: "include",
     cache: "no-store",
   });
   if (!res.ok) {
@@ -21,6 +24,13 @@ export class ApiError extends Error {
 }
 
 export const api = {
+  login: (username: string, password: string) =>
+    call<Session>("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }),
+  logout: () => call<{ signed_out: boolean }>("/auth/logout", { method: "POST" }),
+  me: () => call<Session>("/auth/me"),
   config: () => call<ConfigResponse>("/config"),
   health: () => call<Health>("/health"),
   solve: (dataset: string, timeLimit: number) =>
@@ -41,6 +51,12 @@ export const api = {
 };
 
 /* ---- types ------------------------------------------------------------- */
+
+export interface Session {
+  username: string;
+  display_name: string;
+  role: "coordinator" | "viewer";
+}
 
 export interface Health {
   status: string;

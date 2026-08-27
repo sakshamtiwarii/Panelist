@@ -17,6 +17,7 @@ import type { Clock } from "@/lib/time";
 
 interface Props {
   proposal: Proposal;
+  canApply: boolean;
   clock: Clock;
   companyName: (id: string) => string;
   applying: boolean;
@@ -26,7 +27,8 @@ interface Props {
 }
 
 export default function DiffPanel({
-  proposal, clock, companyName, applying, onApply, onReject, onHoverStudent,
+  proposal, canApply, clock, companyName, applying, onApply, onReject,
+  onHoverStudent,
 }: Props) {
   const [open, setOpen] = useState<Record<string, boolean>>({ moved: true });
   const d = proposal.diff;
@@ -132,6 +134,13 @@ export default function DiffPanel({
         {proposal.authorization_prompt && (
           <div className="callout">{proposal.authorization_prompt}</div>
         )}
+        {!canApply && (
+          <div className="callout">
+            You are signed in as a viewer. You can review this proposal in full,
+            but applying it changes the live schedule and needs a coordinator
+            account.
+          </div>
+        )}
         {proposal.verification_errors?.length ? (
           <div className="callout err">
             {proposal.verification_errors.length} hard-constraint violations —
@@ -227,7 +236,11 @@ export default function DiffPanel({
         <button
           className="btn btn-primary"
           onClick={onApply}
-          disabled={applying || !!proposal.verification_errors?.length}
+          disabled={applying || !canApply
+                    || !!proposal.verification_errors?.length}
+          title={!canApply
+            ? "Applying a fix changes the live schedule and needs a coordinator account"
+            : undefined}
         >
           {applying ? "Applying…" : over ? "Apply anyway" : "Apply this fix"}
         </button>

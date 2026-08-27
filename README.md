@@ -20,6 +20,7 @@ little as possible.
 generator/    seeded, realistic dataset generation (companies, students, rooms)
 scheduler/    CP-SAT model: hard constraints + infeasibility diagnostics
 replanner/    disruption handling: warm-started re-solve, minimal-churn diff
+store/        Postgres persistence: versioned schedules + replan audit trail
 api/          FastAPI endpoints wrapping generator/scheduler/replanner
 dashboard/    Next.js coordinator UI: schedule view, disruption triggers, diff viewer
 ```
@@ -27,6 +28,63 @@ dashboard/    Next.js coordinator UI: schedule view, disruption triggers, diff v
 `scheduler/model.py` is shared by both the initial scheduler and the
 replanner — the replanner calls it with `prior_schedule` set and a churn
 penalty weight, rather than duplicating constraint logic.
+
+## Signing in
+
+The console is gated — a replan changes hundreds of people's days, so it is not
+an open endpoint. Two demo accounts are seeded on first start:
+
+| Username | Password | Role | Can do |
+|---|---|---|---|
+| `coordinator` | `placement2026` | Coordinator | Everything — build the schedule, replan, **apply** a fix |
+| `viewer` | `review2026` | Viewer | Read the board, metrics and diagnostics; **request** a fix but not apply one |
+
+Both are shown on the sign-in screen and fill the form on click, so there is
+nothing to look up. They exist for evaluation against a synthetic dataset;
+`PANELIST_SEED_USERS=0` disables seeding.
+
+**The permission boundary sits at the state change, not at the feature.**
+A viewer can ask for a proposal — that computes a fix and mutates nothing — but
+cannot commit one. That is the line worth drawing: proposing is free, applying
+moves real appointments.
+
+Passwords are scrypt hashes with a per-user salt. Sessions are HMAC-SHA256
+signed tokens in an httpOnly cookie, so page JavaScript cannot read the session
+and an XSS bug cannot exfiltrate it. Login failures return one message for both
+unknown users and wrong passwords, so the endpoint cannot be used to enumerate
+accounts.
+
+Set `PANELIST_SECRET_KEY` in any real deployment. Unset, the API generates a
+per-process key and says so — sessions then die on restart, which is deliberate:
+an unset secret should be noticed, not silently insecure.
+
+## Persistence
+
+Schedule state lives in Postgres (`store/schema.sql`). Two decisions are worth
+naming:
+
+**Schedules are versioned, not mutated.** A replan writes a new version and
+flips `is_current`; the plan that existed before the disruption stays queryable.
+Mutating in place would destroy exactly the prior state the replanner needs to
+diff against, and would make rollback a re-solve instead of a lookup.
+
+**The shortlist relation is a table, not a JSON column**, because it is what
+answers contention questions. `GET /affected?company_id=…&day=…` returns the
+students a disruption touches *and how many other interviews each still has
+that day* — a correlated count over the same student's other appointments.
+That join is the reason the database earns its place; in Python it means
+loading the whole week into memory first.
+
+`replan_events` keeps an audit trail: every applied replan, what caused it,
+what it cost, how many people needed telling.
+
+**The API never depends on the database being up.** If `DATABASE_URL` is unset
+or unreachable, it logs once and falls back to an in-memory store with the same
+interface. `GET /health` reports which is active, so a downgrade is visible
+rather than silent — a live demo should not open with a connection error.
+
+On startup the API adopts any schedule that outlived the last process, so a
+restart comes back with the week already planned rather than needing a re-solve.
 
 ## Running it
 
@@ -36,6 +94,39 @@ docker compose up
 
 - API: http://localhost:8000
 - Dashboard: http://localhost:3000
+- Postgres: localhost:55432
+
+Then `POST /schedule` (or press **Build schedule** in the dashboard) to solve.
+A fresh clone has no dataset — `data/` is gitignored — so run the generator
+first, or `POST /generate`.
+
+**Port overrides.** Dev machines routinely already run something on 3000, 8000
+or 5432, and Docker publishes on `0.0.0.0`, so it collides with any local
+service bound to all interfaces even when localhost-only tools report the port
+free. Every published port is overridable — copy `.env.example` to `.env` and
+change what clashes:
+
+```bash
+PANELIST_WEB_PORT=3001   # dashboard
+PANELIST_API_PORT=8000   # API
+PANELIST_DB_PORT=55432   # Postgres (host side only)
+```
+
+Defaults match the URLs above, so a clean machine needs no `.env` at all. The
+API always reaches the database as `db:5432` on the compose network; the
+published port exists only for host tooling like `psql`.
+
+Running without Docker:
+
+```bash
+createdb panelist
+export DATABASE_URL="postgresql://$USER@127.0.0.1:5432/panelist"
+uvicorn main:app --port 8000              # from api/
+npm run dev                               # from dashboard/
+```
+
+The schema is created automatically on first connect. Omit `DATABASE_URL`
+entirely and everything still runs, in memory.
 
 To regenerate the dataset with a different seed/size:
 
@@ -144,9 +235,11 @@ near-identical choices as though they were a decision.
 
 ## API
 
+`POST /auth/login` · `POST /auth/logout` · `GET /auth/me` ·
 `POST /generate` · `POST /schedule` · `GET /schedule` (filter by day, room,
-company, student) · `GET /metrics` · `GET /diagnostics` · `POST /replan` ·
-`POST /replan/apply`
+company, student) · `GET /metrics` · `GET /diagnostics` · `GET /affected` ·
+`GET /schedule/versions` · `POST /replan` · `POST /replan/apply` ·
+`GET /replan/history`
 
 ## Status
 
@@ -156,6 +249,10 @@ company, student) · `GET /metrics` · `GET /diagnostics` · `POST /replan` ·
 - **Replanner** — done. Four disruption types, compound events, minimal-churn
   re-solve, structured diff, notify list, churn cap with authorization flow.
 - **API** — done. Propose/apply separation verified end to end.
+- **Persistence** — done. Postgres-backed versioned schedules, impact queries
+  and replan audit trail, with an in-memory fallback.
+- **Auth** — done. Scrypt password hashing, signed httpOnly session cookies,
+  coordinator/viewer roles gating mutation.
 - **Dashboard** — done. Next.js coordinator console (see below).
 
 ## Dashboard
