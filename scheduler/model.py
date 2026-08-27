@@ -57,6 +57,7 @@ class SchedulingModel:
         prior_schedule=None,
         churn_penalty_weight=0,
         tier_bonus=2,
+        locked=None,
     ):
         self.companies = companies
         self.students = students
@@ -65,6 +66,9 @@ class SchedulingModel:
         self.prior_schedule = prior_schedule or {}
         self.churn_penalty_weight = churn_penalty_weight
         self.tier_bonus = tier_bonus
+        # Interviews that already happened: pinned to their prior time so a
+        # replan cannot rewrite the past.
+        self.locked = set(locked or ())
 
         self.model = cp_model.CpModel()
         self.constraint_reasons = {}   # constraint_id -> human-readable string
@@ -122,6 +126,31 @@ class SchedulingModel:
     def horizon(self):
         return self.config["days"] * SLOTS_PER_DAY_RAW
 
+    def valid_starts_for(self, interview):
+        """Start slots legal for one interview, narrowed by its company's
+        unavailable windows.
+
+        Windows are explicit (from_slot, to_slot) absolute ranges rather than a
+        single "available from" watermark. A company arriving three hours late
+        on Day 4 is unavailable for Day 4 up to 12:00 and nothing else — a
+        watermark would forbid every earlier day too, silently dragging Day 1
+        interviews across the week. Windows also compose, so several lateness
+        events on different days stack correctly.
+
+        Used for both the model domain and the diagnostics, so the two never
+        disagree about what was actually possible.
+        """
+        starts = self.valid_starts[interview["duration_slots"]]
+        company = self.company_by_id[interview["company_id"]]
+        windows = company.get("unavailable_windows")
+        if not windows:
+            return starts
+        dur = interview["duration_slots"]
+        return [
+            s for s in starts
+            if not any(s < w1 and s + dur > w0 for w0, w1 in windows)
+        ]
+
     # -- model construction -------------------------------------------------
 
     def _build_interviews(self):
@@ -159,10 +188,30 @@ class SchedulingModel:
         horizon = self.horizon()
 
         # --- decision variables -------------------------------------------
+        self.unplaceable = []
         for iv in self.interviews:
             iid, dur = iv["id"], iv["duration_slots"]
-            domain = cp_model.Domain.FromValues(self.valid_starts[dur])
-            start = self.model.NewIntVarFromDomain(domain, f"start_{iid}")
+            allowed = self.valid_starts_for(iv)
+            if not allowed:
+                # The company has no remaining window this interview fits in.
+                # Recorded rather than silently dropped, so the diagnostics can
+                # say so explicitly.
+                self.unplaceable.append(iv)
+                continue
+            prior = self.prior_schedule.get(iid)
+            if iid in self.locked and prior is not None:
+                # Pin by narrowing the domain to a single value rather than
+                # adding `start == prior` as a constraint. Hundreds of equality
+                # constraints make the solve markedly harder (it timed out at
+                # UNKNOWN with 345 locked); a one-value domain propagates
+                # immediately and shrinks the search space instead of growing
+                # the constraint graph.
+                start = self.model.NewIntVar(
+                    prior["start"], prior["start"], f"start_{iid}"
+                )
+            else:
+                domain = cp_model.Domain.FromValues(allowed)
+                start = self.model.NewIntVarFromDomain(domain, f"start_{iid}")
             present = self.model.NewBoolVar(f"present_{iid}")
             end = self.model.NewIntVar(0, horizon, f"end_{iid}")
             self.model.Add(end == start + dur)
@@ -172,6 +221,26 @@ class SchedulingModel:
             self.start[iid] = start
             self.present[iid] = present
             self.intervals[iid] = interval
+
+            if iid in self.locked and prior is not None:
+                self.model.Add(present == 1)
+
+        # Interviews with no legal slot never enter the model at all.
+        self.interviews = [
+            iv for iv in self.interviews if iv["id"] in self.start
+        ]
+        if self.unplaceable:
+            self._tag(
+                "company_window", "unplaceable",
+                f"{len(self.unplaceable)} interviews have no start slot inside "
+                f"their company's remaining availability window.",
+            )
+        if self.locked:
+            self._tag(
+                "locked", "past",
+                f"{len(self.locked)} interviews already under way or completed "
+                f"are pinned to their original time and cannot be replanned.",
+            )
 
         self._tag(
             "duration_fit", "all",
@@ -200,9 +269,27 @@ class SchedulingModel:
         for cid, iids in by_company.items():
             company = self.company_by_id[cid]
             panels = company["panel_count"]
-            self.model.AddCumulative(
-                [self.intervals[i] for i in iids], [1] * len(iids), panels
-            )
+            panel_intervals = [self.intervals[i] for i in iids]
+            demands = [1] * len(iids)
+
+            # A panel lost partway through the week consumes capacity from
+            # that moment on, the same way a blocked room does. Lowering
+            # panel_count for the whole week instead would retroactively
+            # invalidate interviews that already ran on that panel.
+            for n, (w0, w1) in enumerate(company.get("panel_blackouts", [])):
+                panel_intervals.append(
+                    self.model.NewIntervalVar(
+                        w0, w1 - w0, w1, f"panel_out_{cid}_{n}"
+                    )
+                )
+                demands.append(1)
+                self._tag(
+                    "panel_blackout", f"{cid}#{n}",
+                    f"{company['name']} is down one panel from slot {w0} "
+                    f"onward.",
+                )
+
+            self.model.AddCumulative(panel_intervals, demands, panels)
             self._tag(
                 "panel_capacity", cid,
                 f"{company['name']} runs at most {panels} interviews "
@@ -280,15 +367,28 @@ class SchedulingModel:
     # -- warm start ---------------------------------------------------------
 
     def add_warm_start(self):
-        """Seed the solver with the prior schedule (guide section 2.3)."""
+        """Seed the solver with the prior schedule (guide section 2.3).
+
+        Only hints that are still legal are given. After a disruption some
+        prior placements are no longer in their variable's domain (the company
+        is now unavailable then, say); hinting those hands CP-SAT a partially
+        infeasible starting point it has to discover and unwind, which costs
+        more than the hint saves.
+        """
         if not self.prior_schedule:
             return 0
+        legal = {
+            iv["id"]: set(self.valid_starts_for(iv)) for iv in self.interviews
+        }
         seeded = 0
         for iid, prior in self.prior_schedule.items():
-            if iid in self.start:
-                self.model.AddHint(self.start[iid], prior["start"])
-                self.model.AddHint(self.present[iid], 1)
-                seeded += 1
+            if iid not in self.start:
+                continue
+            if iid not in self.locked and prior["start"] not in legal.get(iid, ()):
+                continue
+            self.model.AddHint(self.start[iid], prior["start"])
+            self.model.AddHint(self.present[iid], 1)
+            seeded += 1
         return seeded
 
     # -- solving ------------------------------------------------------------
@@ -320,6 +420,13 @@ class SchedulingModel:
                 "No valid schedule exists under the current hard constraints. "
                 "This is a genuine model-level infeasibility, not a timeout."
             )
+        elif status == cp_model.UNKNOWN:
+            note = (
+                f"Solver found no schedule within its "
+                f"{solver.parameters.max_time_in_seconds:.0f}s limit. This is "
+                f"a timeout, NOT proof that no schedule exists — retry with a "
+                f"longer limit before concluding the problem is infeasible."
+            )
         else:
             note = f"Solver returned {name} without a usable schedule."
         return {
@@ -327,6 +434,7 @@ class SchedulingModel:
             "usable": status in (cp_model.OPTIMAL, cp_model.FEASIBLE),
             "optimal": status == cp_model.OPTIMAL,
             "note": note,
+            "timed_out": status == cp_model.UNKNOWN,
             "wall_time_seconds": round(solver.WallTime(), 2),
         }
 
@@ -365,9 +473,17 @@ class SchedulingModel:
         for _cid, items in by_company.items():
             free_at = []  # panel index -> slot it frees up
             for a in sorted(items, key=lambda x: x["start"]):
+                # Same stability preference as rooms: keep the prior panel
+                # where it is still free.
+                prior = self.prior_schedule.get(a["id"], {}).get("panel")
+                order = list(range(len(free_at)))
+                if prior is not None and prior in order:
+                    order.remove(prior)
+                    order.insert(0, prior)
+
                 placed = False
-                for p, free in enumerate(free_at):
-                    if free <= a["start"]:
+                for p in order:
+                    if free_at[p] <= a["start"]:
                         free_at[p] = a["end"]
                         a["panel"] = p
                         placed = True
@@ -410,8 +526,17 @@ class SchedulingModel:
         free_at = {r["id"]: 0 for r in self.rooms}
         ok = True
         for a in sorted(scheduled, key=lambda x: x["start"]):
-            for room in self.rooms:
-                rid = room["id"]
+            # Prefer the room this interview was already in. Without this a
+            # replan reshuffles nearly every room even where the time did not
+            # change, and the coordinator sees the whole board move for a
+            # two-hour delay.
+            prior = self.prior_schedule.get(a["id"], {}).get("room")
+            candidates = [r["id"] for r in self.rooms]
+            if prior in free_at:
+                candidates.remove(prior)
+                candidates.insert(0, prior)
+
+            for rid in candidates:
                 if free_at[rid] <= a["start"] and not is_blocked(
                     rid, a["start"], a["end"]
                 ):
@@ -621,7 +746,14 @@ class SchedulingModel:
             cid = iv["company_id"]
             company = self.company_by_id[cid]
             dur = iv["duration_slots"]
-            starts = self.valid_starts[dur]
+            starts = self.valid_starts_for(iv)
+            if not starts:
+                entry = findings[cid]
+                entry["count"] += 1
+                entry["causes"]["company_window"] += 1
+                if len(entry["students"]) < 3:
+                    entry["students"].append(iv["student_id"])
+                continue
 
             panel_blocked = room_blocked = student_blocked = 0
             for s in starts:
