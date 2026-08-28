@@ -1,17 +1,20 @@
-# Build context is the repo root (see docker-compose.yml), so that the
-# generator/scheduler/replanner packages land in the image rather than
-# existing only via compose volume mounts.
+# Build context is the repo root (see docker-compose.yml). The whole project is
+# installed as a package, so `api.auth`, `scheduler.model` etc. resolve by their
+# real dotted names — the image layout no longer has to be replicated by hand
+# for imports to work, and the app runs identically here, from a clean checkout,
+# and under pytest.
 FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY api/requirements.txt .
+# Dependencies first, from requirements.txt alone, so editing source does not
+# invalidate the (slow) ortools install layer.
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY api/ .
-COPY scheduler/ ./scheduler/
-COPY replanner/ ./replanner/
-COPY generator/ ./generator/
-COPY store/ ./store/
+# --no-deps: everything is already installed above; this step only puts the
+# packages on the path.
+COPY . .
+RUN pip install --no-cache-dir --no-deps -e .
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]

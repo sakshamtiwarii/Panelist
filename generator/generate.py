@@ -5,9 +5,12 @@ Produces realistic, seeded companies/students/rooms data for the
 placement week scheduling problem.
 
 Usage:
-    python generator/generate.py --seed 42 --companies 35 --students 800 --rooms 20 --days 4
-    python generator/generate.py --seed 42 --students 40 --companies 6 --rooms 3 --out ./data/small
-    python generator/generate.py --seed 42 --load-factor 1.15 --out ./data/oversubscribed
+    python -m generator.generate --seed 42 --companies 35 --students 800 \
+        --rooms 20 --days 4
+    python -m generator.generate --seed 42 --students 40 --companies 6 \
+        --rooms 3 --out ./data/small
+    python -m generator.generate --seed 42 --load-factor 1.15 \
+        --out ./data/oversubscribed
 
 Realism requirements (see PLACEMENT_SCHEDULER_GUIDE.md section 2.1):
 - Company shortlist sizes are heavy-tailed, not uniform: a few mass recruiters
@@ -123,6 +126,13 @@ def build_config(days):
         ],
         "usable_slots_per_day": slots,
         "slots_per_day_count": len(slots),
+        # The raw grid (lunch included) and the day's origin. Written here so
+        # the dataset carries its whole time model: every reader derives slot
+        # arithmetic from config via scheduler.timegrid instead of keeping a
+        # private copy that a change to the hours above would silently
+        # invalidate.
+        "slots_per_day_raw": (DAY_END_MIN - DAY_START_MIN) // SLOT_MINUTES,
+        "day_start_minutes": DAY_START_MIN,
     }
 
 
@@ -406,48 +416,66 @@ def conflict_density_report(companies, students, rooms, config, capacity_slots):
 
 # --- Entrypoint ------------------------------------------------------------
 
-def main():
-    args = parse_args()
-    rng = random.Random(args.seed)
+def build_dataset(seed=42, companies=35, students=800, rooms=20, days=4,
+                  load_factor=None):
+    """Generate a dataset in memory. Returns (dataset, density_report).
 
-    config = build_config(args.days)
-    companies = generate_companies(rng, args.companies, args.days)
+    Kept separate from file writing and from argparse so the API can call it
+    directly. Spawning `python generator/generate.py` instead would tie the
+    endpoint to the process's working directory and reduce every failure to a
+    truncated stderr string.
+    """
+    rng = random.Random(seed)
+
+    config = build_config(days)
+    company_list = generate_companies(rng, companies, days)
     capacity_slots = scale_shortlist_sizes(
-        companies, args.rooms, args.days, config, args.load_factor
+        company_list, rooms, days, config, load_factor
     )
-    students = generate_students(rng, args.students, companies)
-    assign_shortlists(rng, students, companies)
-    rooms = generate_rooms(rng, args.rooms, args.days, config)
+    student_list = generate_students(rng, students, company_list)
+    assign_shortlists(rng, student_list, company_list)
+    room_list = generate_rooms(rng, rooms, days, config)
 
-    os.makedirs(args.out, exist_ok=True)
     dataset = {
         "meta": {
-            "seed": args.seed,
-            "load_factor_target": args.load_factor,
-            "students": args.students,
-            "companies": args.companies,
-            "rooms": args.rooms,
-            "days": args.days,
+            "seed": seed,
+            "load_factor_target": load_factor,
+            "students": students,
+            "companies": companies,
+            "rooms": rooms,
+            "days": days,
         },
         "config": config,
-        "companies": companies,
-        "students": students,
-        "rooms": rooms,
+        "companies": company_list,
+        "students": student_list,
+        "rooms": room_list,
     }
-    for name, payload in [
-        ("companies", companies), ("students", students), ("rooms", rooms),
-    ]:
-        with open(os.path.join(args.out, f"{name}.json"), "w") as f:
-            json.dump(payload, f, indent=2)
-    with open(os.path.join(args.out, "dataset.json"), "w") as f:
-        json.dump(dataset, f, indent=2)
-
     report = conflict_density_report(
-        companies, students, rooms, config, capacity_slots
+        company_list, student_list, room_list, config, capacity_slots
     )
-    print(report)
-    with open(os.path.join(args.out, "density_report.txt"), "w") as f:
+    return dataset, report
+
+
+def write_dataset(out, dataset, report):
+    """Write the dataset and its density report to `out/`."""
+    os.makedirs(out, exist_ok=True)
+    for name in ("companies", "students", "rooms"):
+        with open(os.path.join(out, f"{name}.json"), "w") as f:
+            json.dump(dataset[name], f, indent=2)
+    with open(os.path.join(out, "dataset.json"), "w") as f:
+        json.dump(dataset, f, indent=2)
+    with open(os.path.join(out, "density_report.txt"), "w") as f:
         f.write(report + "\n")
+
+
+def main():
+    args = parse_args()
+    dataset, report = build_dataset(
+        seed=args.seed, companies=args.companies, students=args.students,
+        rooms=args.rooms, days=args.days, load_factor=args.load_factor,
+    )
+    write_dataset(args.out, dataset, report)
+    print(report)
     print(f"\nWrote dataset to {args.out}/ (seed={args.seed})")
 
 

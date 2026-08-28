@@ -31,8 +31,9 @@ looser fix" flow guide section 4 asks for.
 
 import copy
 
+from scheduler import timegrid
 from scheduler.metrics import compute_churn
-from scheduler.model import SLOTS_PER_DAY_RAW, SchedulingModel
+from scheduler.model import SchedulingModel
 
 # Churn weight for the first attempt: light enough that the solver will still
 # reshuffle to keep interviews scheduled, heavy enough to prefer stability.
@@ -71,7 +72,7 @@ def apply_disruption(dataset, disruption, prior_schedule, now_slot=None):
         day = disruption.get("day", 0)
         hours = disruption["hours"]
         slots_late = int(round(hours * 60 / slot_minutes))
-        day_start = day * SLOTS_PER_DAY_RAW
+        day_start = timegrid.absolute(dataset["config"], day, 0)
         # Blocks only the delayed part of THAT day. A watermark would forbid
         # every earlier day as well and drag unrelated interviews across the
         # week; several lateness events on different days stack as windows.
@@ -91,7 +92,7 @@ def apply_disruption(dataset, disruption, prior_schedule, now_slot=None):
         company = companies[cid]
         count = disruption.get("count", 1)
         from_slot = disruption.get("from_slot")
-        horizon = dataset["config"]["days"] * SLOTS_PER_DAY_RAW
+        horizon = timegrid.horizon(dataset["config"])
 
         if from_slot is None:
             # No time given: the panel was never available this week.
@@ -133,7 +134,8 @@ def apply_disruption(dataset, disruption, prior_schedule, now_slot=None):
         room = rooms[rid]
         day = disruption.get("day", 0)
         from_slot = disruption.get("from_slot", 0)
-        to_slot = disruption.get("to_slot", SLOTS_PER_DAY_RAW)
+        to_slot = disruption.get(
+            "to_slot", timegrid.slots_per_day_raw(dataset["config"]))
         room.setdefault("blocked_windows", []).append({
             "day": day,
             "from_slot": from_slot,
@@ -341,8 +343,8 @@ def _withdraw_student(dataset, prior_schedule, sid, scope, from_slot,
             "student_withdraw with scope='day' needs from_slot "
             "(the moment the offer was accepted)"
         )
-    day = from_slot // SLOTS_PER_DAY_RAW
-    day_end = (day + 1) * SLOTS_PER_DAY_RAW
+    day, _ = timegrid.split(dataset["config"], from_slot)
+    day_end = timegrid.absolute(dataset["config"], day + 1, 0)
 
     # A withdrawal cancels what is still ahead of the student, never what has
     # already been sat. Without this clamp a mid-day offer retroactively
@@ -731,14 +733,13 @@ def compute_notify_list(diff, dataset, old_schedule, new_schedule,
     # to the pre-amendment names before the bare id.
     names = dict(extra_names or {})
     names.update({c["id"]: c["name"] for c in dataset["companies"]})
-    slot_minutes = dataset["config"]["slot_minutes"]
 
     def company_name(cid):
         return names.get(cid, cid)
 
     def clock(rec):
-        mins = 9 * 60 + rec["slot"] * slot_minutes
-        return f"Day {rec['day'] + 1} {mins // 60:02d}:{mins % 60:02d}"
+        return (f"Day {rec['day'] + 1} "
+                f"{timegrid.clock(dataset['config'], rec['slot'])}")
 
     per_student = {}
 

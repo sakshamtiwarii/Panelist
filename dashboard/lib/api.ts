@@ -85,6 +85,7 @@ export interface Company {
   panel_count: number;
   interview_minutes: number;
   shortlist_size: number;
+  cgpa_cutoff: number;
 }
 
 export interface ConfigResponse {
@@ -171,6 +172,14 @@ export interface DisruptionEvent {
   from_slot?: number;
   to_slot?: number;
   reason?: string;
+  // roster amendments
+  name?: string;
+  tier?: number;
+  cgpa_cutoff?: number;
+  panel_count?: number;
+  interview_minutes?: number;
+  shortlist?: string[];
+  shortlist_size?: number;
 }
 
 export interface ReplanBody {

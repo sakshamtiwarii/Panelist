@@ -19,15 +19,32 @@ little as possible.
 ```
 generator/    seeded, realistic dataset generation (companies, students, rooms)
 scheduler/    CP-SAT model: hard constraints + infeasibility diagnostics
+  timegrid.py the slot grid, read from a dataset's config
 replanner/    disruption handling: warm-started re-solve, minimal-churn diff
 store/        Postgres persistence: versioned schedules + replan audit trail
 api/          FastAPI endpoints wrapping generator/scheduler/replanner
+  deps.py     the store and the live-dataset accessors
+  schemas.py  request bodies
+  routes/     auth · schedule · roster · replan
 dashboard/    Next.js coordinator UI: schedule view, disruption triggers, diff viewer
 ```
+
+Dependencies run one way — `generator` and `store` depend on nothing internal,
+`scheduler` on nothing but itself, `replanner` on `scheduler`, `api` on all of
+them, and `dashboard` talks HTTP only. Everything installs as one package
+(`pip install -e .`), so imports resolve by their real dotted names rather than
+by patching `sys.path` at import time.
 
 `scheduler/model.py` is shared by both the initial scheduler and the
 replanner — the replanner calls it with `prior_schedule` set and a churn
 penalty weight, rather than duplicating constraint logic.
+
+**The time grid has one source.** The generator decides the working day and
+writes the whole model — slot length, day origin, lunch, raw slots per day —
+into the dataset's `config`; every other module reads it back through
+`scheduler/timegrid.py`. A private copy of `SLOTS_PER_DAY_RAW = 32` cannot fail
+loudly, only quietly: nothing crashes, every appointment just renders at the
+wrong clock time.
 
 ## Signing in
 
@@ -154,19 +171,48 @@ published port exists only for host tooling like `psql`.
 Running without Docker:
 
 ```bash
+pip install -e .                          # from the repo root, once
 createdb panelist
 export DATABASE_URL="postgresql://$USER@127.0.0.1:5432/panelist"
-uvicorn main:app --port 8000              # from api/
+uvicorn api.main:app --port 8000          # from the repo root
 npm run dev                               # from dashboard/
 ```
+
+The project installs as a package, so `api.main`, `scheduler.model` and the
+rest resolve by their real dotted names in every context — container, bare
+checkout, and test run alike. The CLIs are module entry points for the same
+reason: use `python -m scheduler.run`, not `python scheduler/run.py`.
 
 The schema is created automatically on first connect. Omit `DATABASE_URL`
 entirely and everything still runs, in memory.
 
+## Tests
+
+```bash
+pip install -e ".[dev]"
+pytest tests/test_api.py             # ~3s, generates its own dataset
+python -m tests.test_replan_scenarios # ~4min, every disruption type
+ruff check .
+```
+
+`tests/test_api.py` covers the boundaries the scenario suite cannot reach:
+authentication, the coordinator/viewer split, and the propose → apply
+handshake. It generates its own dataset rather than reading `data/`, which is
+gitignored, so it runs on a fresh clone.
+
+`tests/test_replan_scenarios.py` runs every disruption type plus the compound
+injection against the primary dataset with a mid-day lock, and asserts what
+must hold whatever the solver decides: zero student clashes (recomputed
+independently), the model's own hard-constraint verification, and that
+interviews already under way are neither moved nor cancelled.
+
+Both run in CI (`.github/workflows/ci.yml`) alongside a dashboard typecheck
+and build.
+
 To regenerate the dataset with a different seed/size:
 
 ```bash
-python generator/generate.py --seed 42 --companies 35 --students 800 --rooms 20 --days 4
+python -m generator.generate --seed 42 --companies 35 --students 800 --rooms 20 --days 4
 ```
 
 ## Design decisions (defended)
@@ -207,7 +253,7 @@ company pairs.
 ## Solver results
 
 ```bash
-python scheduler/run.py --data ./data/primary --time-limit 30
+python -m scheduler.run --data ./data/primary --time-limit 30
 ```
 
 | Dataset | Interviews | Status | Time | Scheduled | Clashes | Room util |
@@ -236,8 +282,8 @@ schedule plus an attributed shortfall, rather than a bare INFEASIBLE.
 ## Replanning
 
 ```bash
-python replanner/run.py --data ./data/primary --scenario compound
-python replanner/run.py --data ./data/primary --scenario room --now-slot 48
+python -m replanner.run --data ./data/primary --scenario compound
+python -m replanner.run --data ./data/primary --scenario room --now-slot 48
 ```
 
 Scenarios (`late`, `panel`, `withdraw`, `room`, `compound`) are derived from

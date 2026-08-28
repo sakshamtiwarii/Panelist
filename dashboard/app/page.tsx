@@ -165,6 +165,8 @@ export default function Page() {
       setQueue([]);
       await refresh();
     } catch (e) {
+      // Roster edits are validated server-side (CGPA cutoffs, duplicates,
+      // unknown ids) and come back as 400s with a readable reason.
       setError(describeError(e));
     } finally {
       setBusy(null);
@@ -216,8 +218,18 @@ export default function Page() {
           return `${companyName(e.company_id!)} — panel out from ${clock.stamp(e.from_slot!)}`;
         case "student_withdraw":
           return `${e.student_id} — withdraws from ${clock.stamp(e.from_slot!)}`;
-        default:
+        case "room_unavailable":
           return `${e.room_id} — unavailable Day ${(e.day ?? 0) + 1}`;
+        case "company_add":
+          return `Add ${e.name} — ${e.shortlist_size} students at CGPA ${e.cgpa_cutoff}+`;
+        case "company_remove":
+          return `${companyName(e.company_id!)} — withdraws from the week`;
+        case "shortlist_add":
+          return `${e.student_id} → ${companyName(e.company_id!)} shortlist`;
+        case "shortlist_remove":
+          return `${e.student_id} off ${companyName(e.company_id!)} shortlist`;
+        default:
+          return e.type;
       }
     },
     [clock, companyName],
@@ -400,7 +412,9 @@ export default function Page() {
             >
               {busy === "Replanning"
                 ? "Working out a fix…"
-                : `Replan around ${queue.length || "these"} event${queue.length === 1 ? "" : "s"}`}
+                : queue.length
+                  ? `Replan around ${queue.length} change${queue.length === 1 ? "" : "s"}`
+                  : "Replan"}
             </button>
             <p className="hint" style={{ marginTop: 10, marginBottom: 0 }}>
               You&rsquo;ll get a proposal to review first. Nothing on the

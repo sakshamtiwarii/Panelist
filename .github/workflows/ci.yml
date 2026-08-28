@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dashboard]
+  pull_request:
+
+jobs:
+  api:
+    name: Python — install, lint, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # The package install is itself the test that the layout is sound: it is
+      # what replaced four sys.path.insert() calls, so a regression there fails
+      # here rather than at runtime in a container.
+      - name: Install
+        run: pip install -e ".[dev]" ruff
+
+      - name: Lint
+        run: ruff check .
+
+      # data/ is gitignored, so a fresh checkout has no dataset. The API suite
+      # generates its own; this only proves the CLI path still works.
+      - name: Generate a dataset
+        run: python -m generator.generate --seed 42 --companies 6 --students 40 --rooms 3 --days 4 --out ./data/small
+
+      - name: Solve it
+        run: python -m scheduler.run --data ./data/small --time-limit 20
+
+      - name: API contract tests
+        run: pytest tests/test_api.py -q
+
+  dashboard:
+    name: Dashboard — typecheck and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm run build

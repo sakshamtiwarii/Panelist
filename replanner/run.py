@@ -1,8 +1,8 @@
 """
 Panelist — replanner CLI.
 
-    python replanner/run.py --data ./data/primary --scenario late
-    python replanner/run.py --data ./data/primary --scenario compound
+    python -m replanner.run --data ./data/primary --scenario late
+    python -m replanner.run --data ./data/primary --scenario compound
 
 Applies a disruption to an existing schedule, re-solves with a churn penalty,
 and prints the diff, the notify list and the churn against the cap. Nothing is
@@ -12,13 +12,10 @@ committed unless --apply is passed.
 import argparse
 import json
 import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from replanner.replan import apply_proposal, replan  # noqa: E402
-from scheduler.metrics import compute_metrics, format_metrics  # noqa: E402
-from scheduler.model import SLOTS_PER_DAY_RAW  # noqa: E402
+from replanner.replan import apply_proposal, replan
+from scheduler import timegrid
+from scheduler.metrics import compute_metrics, format_metrics
 
 
 def build_scenarios(schedule, dataset):
@@ -30,6 +27,8 @@ def build_scenarios(schedule, dataset):
     minimal-churn replan but is really a no-op. Each scenario below targets
     the (entity, day) pair that the current schedule actually loads.
     """
+    config = dataset["config"]
+    slots_raw = timegrid.slots_per_day_raw(config)
     lateness_slots = 12  # 3 hours at 15-minute slots
 
     # Late arrival: the (company, day) with the most interviews that would be
@@ -93,7 +92,7 @@ def build_scenarios(schedule, dataset):
         }],
         "room": [{
             "type": "room_unavailable", "room_id": busy_room,
-            "day": busy_day, "from_slot": 0, "to_slot": SLOTS_PER_DAY_RAW,
+            "day": busy_day, "from_slot": 0, "to_slot": slots_raw,
             "reason": "burst pipe",
         }],
         # Guide section 11: their own injection stacks three kinds at once.
@@ -101,7 +100,7 @@ def build_scenarios(schedule, dataset):
             {"type": "company_late", "company_id": late_company,
              "day": late_day, "hours": 3},
             {"type": "panel_drop", "company_id": late_company, "count": 1,
-             "from_slot": late_day * SLOTS_PER_DAY_RAW + 12},
+             "from_slot": timegrid.absolute(config, late_day, 12)},
         ] + [
             {"type": "student_withdraw", "student_id": sid,
              "scope": "day", "from_slot": withdraw_event(items)}

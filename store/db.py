@@ -66,6 +66,7 @@ class MemoryStore:
         self._schedules = {}   # dataset -> list of version dicts
         self._replans = {}     # dataset -> list
         self._users = {}
+        self._proposals = {}   # proposal_id -> {dataset, payload, expires}
 
     def describe(self):
         return "in-memory (not persisted)"
@@ -109,6 +110,12 @@ class MemoryStore:
             for e in self._schedules.get(dataset, [])
         ]
 
+    def current_dataset(self):
+        for name, versions in self._schedules.items():
+            if versions:
+                return name
+        return None
+
     # -- replan audit ----------------------------------------------------
     def record_replan(self, dataset, disruptions, proposal, to_version):
         d = proposal["diff"]
@@ -125,6 +132,25 @@ class MemoryStore:
 
     def replan_history(self, dataset, limit=20):
         return list(reversed(self._replans.get(dataset, [])))[:limit]
+
+    # -- proposals -------------------------------------------------------
+    def put_proposal(self, pid, dataset, payload, ttl_minutes=30):
+        self._proposals[pid] = {
+            "dataset": dataset, "payload": payload,
+            "expires": time.time() + ttl_minutes * 60,
+        }
+
+    def get_proposal(self, pid):
+        row = self._proposals.get(pid)
+        if row is None or row["expires"] < time.time():
+            self._proposals.pop(pid, None)
+            return None
+        return row["payload"]
+
+    def clear_proposals(self, dataset):
+        for pid, row in list(self._proposals.items()):
+            if row["dataset"] == dataset:
+                del self._proposals[pid]
 
     # -- users -----------------------------------------------------------
     def put_user(self, username, display_name, role, salt, password_hash):
@@ -430,6 +456,17 @@ class PostgresStore:
                 "appointments": r[5],
             } for r in cur.fetchall()]
 
+    def current_dataset(self):
+        """The dataset that has a live schedule, or None.
+
+        Lets a freshly-started worker find the current dataset instead of
+        depending on having served the request that solved it.
+        """
+        with self.conn, self.conn.cursor() as cur:
+            cur.execute("SELECT dataset FROM schedules WHERE is_current LIMIT 1")
+            row = cur.fetchone()
+        return row[0] if row else None
+
     # -- replan audit ----------------------------------------------------
     def record_replan(self, dataset, disruptions, proposal, to_version):
         d = proposal["diff"]
@@ -474,6 +511,35 @@ class PostgresStore:
                 "churn_pct": r[4], "cap_exceeded": r[5],
                 "notify_count": r[6], "schedule_id": r[7],
             } for r in cur.fetchall()]
+
+    # -- proposals -------------------------------------------------------
+    def put_proposal(self, pid, dataset, payload, ttl_minutes=30):
+        with self.conn, self.conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO proposals (id, dataset, payload, expires_at)
+                   VALUES (%s, %s, %s, now() + make_interval(mins => %s))""",
+                (pid, dataset, json.dumps(payload), ttl_minutes))
+
+    def get_proposal(self, pid):
+        """The stored proposal, or None if unknown or expired."""
+        with self.conn, self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT payload FROM proposals WHERE id = %s AND expires_at > now()",
+                (pid,))
+            row = cur.fetchone()
+        return row[0] if row else None
+
+    def clear_proposals(self, dataset):
+        """Drop every pending proposal for a dataset.
+
+        Called after one is applied: the rest were computed against a schedule
+        that no longer exists, so applying them would silently write a plan
+        built from stale state. Expired rows go at the same time.
+        """
+        with self.conn, self.conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM proposals WHERE dataset = %s OR expires_at <= now()",
+                (dataset,))
 
     # -- users -----------------------------------------------------------
     def put_user(self, username, display_name, role, salt, password_hash):

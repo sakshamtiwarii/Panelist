@@ -42,9 +42,7 @@ from collections import defaultdict
 
 from ortools.sat.python import cp_model
 
-# Slots per day on the raw grid, including the (unusable) lunch band, so that
-# absolute_slot = day * SLOTS_PER_DAY_RAW + slot_in_day stays simple.
-SLOTS_PER_DAY_RAW = 32
+from scheduler import timegrid
 
 
 class SchedulingModel:
@@ -63,6 +61,8 @@ class SchedulingModel:
         self.students = students
         self.rooms = rooms
         self.config = config
+        # Read from the dataset, never hardcoded: see scheduler/timegrid.py.
+        self.slots_raw = timegrid.slots_per_day_raw(config)
         self.prior_schedule = prior_schedule or {}
         self.churn_penalty_weight = churn_penalty_weight
         self.tier_bonus = tier_bonus
@@ -120,11 +120,11 @@ class SchedulingModel:
             for day in range(self.config["days"]):
                 for lo, hi in blocks:
                     for s in range(lo, hi - dur + 1):
-                        by_duration[dur].append(day * SLOTS_PER_DAY_RAW + s)
+                        by_duration[dur].append(day * self.slots_raw + s)
         return by_duration
 
     def horizon(self):
-        return self.config["days"] * SLOTS_PER_DAY_RAW
+        return timegrid.horizon(self.config)
 
     def valid_starts_for(self, interview):
         """Start slots legal for one interview, narrowed by its company's
@@ -301,8 +301,8 @@ class SchedulingModel:
         demands = [1] * len(room_intervals)
         for room in self.rooms:
             for w in room.get("blocked_windows", []):
-                lo = w["day"] * SLOTS_PER_DAY_RAW + w["from_slot"]
-                hi = w["day"] * SLOTS_PER_DAY_RAW + w["to_slot"]
+                lo = w["day"] * self.slots_raw + w["from_slot"]
+                hi = w["day"] * self.slots_raw + w["to_slot"]
                 room_intervals.append(
                     self.model.NewIntervalVar(
                         lo, hi - lo, hi, f"blocked_{room['id']}_{w['day']}"
@@ -457,8 +457,8 @@ class SchedulingModel:
                 **iv,
                 "start": abs_start,
                 "end": abs_start + iv["duration_slots"],
-                "day": abs_start // SLOTS_PER_DAY_RAW,
-                "slot": abs_start % SLOTS_PER_DAY_RAW,
+                "day": abs_start // self.slots_raw,
+                "slot": abs_start % self.slots_raw,
             })
 
         self._assign_panels(scheduled)
@@ -496,8 +496,8 @@ class SchedulingModel:
         blocked = defaultdict(list)
         for room in self.rooms:
             for w in room.get("blocked_windows", []):
-                lo = w["day"] * SLOTS_PER_DAY_RAW + w["from_slot"]
-                hi = w["day"] * SLOTS_PER_DAY_RAW + w["to_slot"]
+                lo = w["day"] * self.slots_raw + w["from_slot"]
+                hi = w["day"] * self.slots_raw + w["to_slot"]
                 blocked[room["id"]].append((lo, hi))
         return blocked
 
@@ -615,7 +615,7 @@ class SchedulingModel:
                 load[t] += 1
         for room in self.rooms:
             for w in room.get("blocked_windows", []):
-                base = w["day"] * SLOTS_PER_DAY_RAW
+                base = w["day"] * self.slots_raw
                 for t in range(base + w["from_slot"], base + w["to_slot"]):
                     load[t] += 1
 
@@ -624,15 +624,15 @@ class SchedulingModel:
         # Contiguous runs of fully-saturated slots, as clock windows.
         saturated = sorted(
             t for t, n in load.items()
-            if n >= n_rooms and (t % SLOTS_PER_DAY_RAW) in usable
+            if n >= n_rooms and (t % self.slots_raw) in usable
         )
         # Runs must break at a day boundary as well as at a gap, or a window
         # can wrap from one day's afternoon into the next day's morning and
         # report a nonsense clock range.
         windows, run = [], []
         for t in saturated:
-            same_day = run and (t // SLOTS_PER_DAY_RAW) == (
-                run[-1] // SLOTS_PER_DAY_RAW
+            same_day = run and (t // self.slots_raw) == (
+                run[-1] // self.slots_raw
             )
             if same_day and t == run[-1] + 1:
                 run.append(t)
@@ -643,25 +643,15 @@ class SchedulingModel:
         if run:
             windows.append(run)
 
-        def clock_from_slot(slot_in_day):
-            """Clock time for a slot index within a day.
-
-            Takes slot-in-day rather than an absolute slot: an end-exclusive
-            boundary at the last slot of a day would otherwise wrap to 09:00
-            of the following day.
-            """
-            mins = 9 * 60 + slot_in_day * slot_minutes
-            return f"{mins // 60:02d}:{mins % 60:02d}"
-
         # Contention per window: how many *distinct* unscheduled interviews
         # could legally have started inside it. Counting every saturated slot
         # an interview could use would just re-report the global unscheduled
         # total on every window.
         window_report = []
         for w in sorted(windows, key=len, reverse=True)[:6]:
-            day = w[0] // SLOTS_PER_DAY_RAW
-            frm = clock_from_slot(w[0] % SLOTS_PER_DAY_RAW)
-            to = clock_from_slot((w[-1] % SLOTS_PER_DAY_RAW) + 1)
+            day = w[0] // self.slots_raw
+            frm = timegrid.clock(self.config, w[0] % self.slots_raw)
+            to = timegrid.clock(self.config, (w[-1] % self.slots_raw) + 1)
             window_report.append({
                 "day": day + 1,
                 "from": frm,
@@ -678,7 +668,7 @@ class SchedulingModel:
         per_day = {}
         for d in range(days):
             used = sum(
-                n for t, n in load.items() if t // SLOTS_PER_DAY_RAW == d
+                n for t, n in load.items() if t // self.slots_raw == d
             )
             per_day[d + 1] = round(100.0 * used / (n_rooms * slots_per_day), 1)
 
@@ -821,6 +811,8 @@ class SchedulingModel:
                     f"(e.g. {', '.join(entry['students'])})."
                 )
 
+            tag = (f"panel_capacity:{cid}" if dominant == "panel_capacity"
+                   else "room_capacity:global")
             report.append({
                 "company_id": cid,
                 "company": company["name"],
@@ -828,9 +820,7 @@ class SchedulingModel:
                 "demand": demand,
                 "dominant_cause": dominant,
                 "cause_breakdown": dict(entry["causes"]),
-                "constraint_tag": self.constraint_reasons.get(
-                    f"{'panel_capacity:' + cid if dominant == 'panel_capacity' else 'room_capacity:global'}"
-                ),
+                "constraint_tag": self.constraint_reasons.get(tag),
                 "reason": reason,
                 "example_students": entry["students"],
             })

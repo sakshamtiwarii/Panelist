@@ -1,7 +1,7 @@
 """
 Panelist — scheduler CLI.
 
-    python scheduler/run.py --data ./data/primary --time-limit 30
+    python -m scheduler.run --data ./data/primary --time-limit 30
 
 Solves an initial schedule, verifies it independently, prints metrics and
 (when interviews go unscheduled) the attributed infeasibility diagnostics.
@@ -10,12 +10,10 @@ Solves an initial schedule, verifies it independently, prints metrics and
 import argparse
 import json
 import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from scheduler.metrics import compute_metrics, format_metrics  # noqa: E402
-from scheduler.model import SLOTS_PER_DAY_RAW, SchedulingModel  # noqa: E402
+from scheduler import timegrid
+from scheduler.metrics import compute_metrics, format_metrics
+from scheduler.model import SchedulingModel
 
 
 def parse_args():
@@ -31,9 +29,8 @@ def load_dataset(path):
         return json.load(f)
 
 
-def slot_to_clock(day, slot, slot_minutes=15, day_start_min=9 * 60):
-    minutes = day_start_min + slot * slot_minutes
-    return f"D{day + 1} {minutes // 60:02d}:{minutes % 60:02d}"
+def slot_to_clock(config, day, slot):
+    return f"D{day + 1} {timegrid.clock(config, slot)}"
 
 
 def main():
@@ -105,7 +102,7 @@ def main():
 
     print("\n-- Sample of the schedule -----------------------------------------")
     for a in sorted(scheduled, key=lambda x: x["start"])[:8]:
-        print(f"  {slot_to_clock(a['day'], a['slot'])}  "
+        print(f"  {slot_to_clock(ds['config'], a['day'], a['slot'])}  "
               f"{a['room']}  panel {a['panel']}  "
               f"{a['company_id']} x {a['student_id']}")
 

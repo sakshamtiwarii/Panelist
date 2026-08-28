@@ -32,18 +32,18 @@ services:
       # image; the volume mounts below are for dev hot-reload only.
       context: .
       dockerfile: api/Dockerfile
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
     volumes:
-      - ./api:/app
-      - ./scheduler:/app/scheduler
-      - ./replanner:/app/replanner
-      - ./generator:/app/generator
-      - ./store:/app/store
-      # Datasets are generated artefacts and gitignored, so a fresh clone has
-      # none. Mounting the host directory means POST /generate writes somewhere
-      # that survives the container, and an existing dataset is picked up
-      # without rebuilding the image.
-      - ./data:/app/data
+      # One mount of the repo, matching the image layout. The five separate
+      # mounts this replaces had to recreate the package tree by hand, and left
+      # empty api/scheduler, api/store ... directories in the checkout that
+      # looked like real source. Datasets are generated artefacts and
+      # gitignored, so this also means POST /generate writes somewhere that
+      # survives the container.
+      - .:/app
+      # Keep the image's editable install; the bind mount above would otherwise
+      # hide it behind the host directory.
+      - /app/panelist.egg-info
     ports:
       - "${PANELIST_API_PORT:-8000}:8000"
     environment:

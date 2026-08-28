@@ -1,0 +1,15 @@
+# Matches the style the codebase already follows.
+line-length = 88
+target-version = "py311"
+
+[lint]
+# E402 (import not at top) is deliberately NOT ignored: it was only ever
+# needed for the sys.path.insert() hacks, and those are gone.
+select = ["E", "F", "W", "I"]
+
+[lint.per-file-ignores]
+"tests/*" = ["E501"]
+# The SQL literals here run past 88 columns. Wrapping them splits statements
+# mid-clause and makes the queries harder to read than the overrun does, so the
+# rule is waived for this file rather than the code contorted to satisfy it.
+"store/db.py" = ["E501"]
