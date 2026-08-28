@@ -14,10 +14,12 @@ died, and a live defense should not open with a connection error. `GET /health`
 reports which store is active, so the degradation is visible rather than silent.
 """
 
+import contextlib
 import datetime
 import json
 import os
 import pathlib
+import threading
 import time
 
 SCHEMA_PATH = pathlib.Path(__file__).with_name("schema.sql")
@@ -221,9 +223,25 @@ class PostgresStore:
         self.url = url
         self.conn = psycopg2.connect(url)
         self.conn.autocommit = False
+        self._lock = threading.RLock()
+
+    @contextlib.contextmanager
+    def _tx(self):
+        """A transaction with exclusive use of the single connection.
+
+        FastAPI runs sync endpoints in a threadpool, so concurrent requests
+        share this store — and the dashboard deliberately fires /schedule and
+        /metrics together. A psycopg2 connection is not safe for concurrent
+        transactions and `with conn` is not reentrant, so without this the
+        second thread dies with "the connection cannot be re-entered
+        recursively" while the first succeeds: an error that appears only
+        under real concurrency, and never in a sequential test.
+        """
+        with self._lock, self.conn, self.conn.cursor() as cur:
+            yield cur
 
     def describe(self):
-        with self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute("select current_database()")
             return f"database {cur.fetchone()[0]}"
 
@@ -234,14 +252,14 @@ class PostgresStore:
             pass
 
     def init_schema(self):
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(SCHEMA_PATH.read_text())
 
     # -- datasets --------------------------------------------------------
     def put_dataset(self, name, ds):
         """Replace a dataset wholesale. Cascades wipe dependent schedules,
         which is correct: a schedule for different input data is meaningless."""
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute("DELETE FROM datasets WHERE name = %s", (name,))
             cur.execute(
                 "INSERT INTO datasets (name, seed, config) VALUES (%s, %s, %s)",
@@ -277,7 +295,7 @@ class PostgresStore:
 
     def get_dataset(self, name):
         """Rebuild the solver's input dict from the tables."""
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 "SELECT seed, config FROM datasets WHERE name = %s", (name,))
             row = cur.fetchone()
@@ -343,7 +361,7 @@ class PostgresStore:
         """
         companies = ds["companies"]
         keep = [c["id"] for c in companies]
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.executemany(
                 """INSERT INTO companies (dataset, id, name, tier, cgpa_cutoff,
                        panel_count, interview_minutes, duration_slots,
@@ -391,7 +409,7 @@ class PostgresStore:
     # -- schedules -------------------------------------------------------
     def put_schedule(self, dataset, scheduled, unscheduled, report, metrics,
                      origin="solve"):
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 "SELECT COALESCE(MAX(version), 0) + 1 FROM schedules WHERE dataset = %s",
                 (dataset,))
@@ -426,7 +444,7 @@ class PostgresStore:
         return version
 
     def get_current(self, dataset):
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 """SELECT id, version, origin, solver_status, solve_seconds, metrics
                    FROM schedules WHERE dataset = %s AND is_current""", (dataset,))
@@ -455,7 +473,7 @@ class PostgresStore:
         }
 
     def versions(self, dataset):
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 """SELECT s.version, s.origin, s.solver_status, s.is_current,
                           s.created_at, COUNT(a.interview_id)
@@ -475,7 +493,7 @@ class PostgresStore:
         Lets a freshly-started worker find the current dataset instead of
         depending on having served the request that solved it.
         """
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute("SELECT dataset FROM schedules WHERE is_current LIMIT 1")
             row = cur.fetchone()
         return row[0] if row else None
@@ -483,7 +501,7 @@ class PostgresStore:
     # -- replan audit ----------------------------------------------------
     def record_replan(self, dataset, disruptions, proposal, to_version):
         d = proposal["diff"]
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 "SELECT id FROM schedules WHERE dataset = %s AND version = %s",
                 (dataset, to_version))
@@ -512,7 +530,7 @@ class PostgresStore:
                  json.dumps(proposal["notify"])))
 
     def replan_history(self, dataset, limit=20):
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 """SELECT applied_at, descriptions, elective_churn, forced_churn,
                           churn_pct, cap_exceeded, notify_count, to_schedule
@@ -527,7 +545,7 @@ class PostgresStore:
 
     # -- proposals -------------------------------------------------------
     def put_proposal(self, pid, dataset, payload, ttl_minutes=30):
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 """INSERT INTO proposals (id, dataset, payload, expires_at)
                    VALUES (%s, %s, %s, now() + make_interval(mins => %s))""",
@@ -535,7 +553,7 @@ class PostgresStore:
 
     def get_proposal(self, pid):
         """The stored proposal, or None if unknown or expired."""
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 "SELECT payload FROM proposals WHERE id = %s AND expires_at > now()",
                 (pid,))
@@ -549,14 +567,14 @@ class PostgresStore:
         that no longer exists, so applying them would silently write a plan
         built from stale state. Expired rows go at the same time.
         """
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 "DELETE FROM proposals WHERE dataset = %s OR expires_at <= now()",
                 (dataset,))
 
     # -- users -----------------------------------------------------------
     def put_user(self, username, display_name, role, salt, password_hash):
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 """INSERT INTO users (username, display_name, role, salt, password_hash)
                    VALUES (%s,%s,%s,%s,%s)
@@ -570,7 +588,7 @@ class PostgresStore:
                  self._psycopg2.Binary(password_hash)))
 
     def get_user(self, username):
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 """SELECT username, display_name, role, salt, password_hash
                    FROM users WHERE username = %s""", (username,))
@@ -581,7 +599,7 @@ class PostgresStore:
                 "salt": bytes(r[3]), "password_hash": bytes(r[4])}
 
     def touch_login(self, username):
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 "UPDATE users SET last_login = now() WHERE username = %s",
                 (username,))
@@ -626,7 +644,7 @@ class PostgresStore:
             GROUP BY h.student_id, st.cgpa, h.schedule_id, h.day
             ORDER BY interviews_hit DESC, h.student_id
         """
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(sql, params + [dataset])
             return [{
                 "student_id": r[0], "cgpa": r[1],

@@ -149,6 +149,34 @@ def test_affected_counts_other_interviews_that_day(store, dataset_name, sample):
         assert r["other_interviews_that_day"] == len(same_day) - r["interviews_hit"]
 
 
+def test_concurrent_reads_do_not_collide(store, dataset_name, sample):
+    """Several threads hitting the store at once must all succeed.
+
+    FastAPI serves sync endpoints from a threadpool and the dashboard fires
+    /schedule and /metrics together, so this is the normal case, not an edge
+    one. A single psycopg2 connection is not safe for concurrent transactions:
+    before the store serialized access, the second thread raised "the
+    connection cannot be re-entered recursively" while the first returned 200.
+    A sequential test cannot see it.
+    """
+    import concurrent.futures as cf
+
+    ds, sched = sample
+    store.put_dataset(dataset_name, ds)
+    store.put_schedule(dataset_name, sched, [], {"status": "OPTIMAL"}, {})
+
+    def hammer(_):
+        assert store.get_current(dataset_name)["version"] == 1
+        assert store.current_dataset() is not None
+        assert store.versions(dataset_name)
+        store.affected(dataset_name, day=0)
+        return True
+
+    with cf.ThreadPoolExecutor(max_workers=8) as pool:
+        # Surfaces any exception raised inside a worker.
+        assert all(pool.map(hammer, range(24)))
+
+
 def test_users_round_trip(store):
     salt, digest = b"0123456789abcdef", b"x" * 32
     store.put_user("someone", "Some One", "viewer", salt, digest)

@@ -17,6 +17,31 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/** The API base this build talks to — shown in diagnostics. */
+export const API_BASE = BASE;
+
+export type Reachability = "unreachable" | "origin-rejected";
+
+/**
+ * Tell a dead API apart from a CORS rejection.
+ *
+ * A browser reports both as the same `TypeError: Failed to fetch` on purpose —
+ * leaking which one it was would let a page probe cross-origin servers. A
+ * `no-cors` request sidesteps that: the response is opaque and unreadable, but
+ * it RESOLVES when the server answered and REJECTS when nothing was listening.
+ * That is enough to tell the coordinator whether the API is down or whether
+ * this page is simply on an origin the API does not allow — usually the wrong
+ * port, which otherwise looks identical to a crashed backend.
+ */
+export async function diagnoseReachability(): Promise<Reachability> {
+  try {
+    await fetch(`${BASE}/health`, { mode: "no-cors", cache: "no-store" });
+    return "origin-rejected";
+  } catch {
+    return "unreachable";
+  }
+}
+
 export class ApiError extends Error {
   constructor(public status: number, public detail: unknown) {
     super(typeof detail === "string" ? detail : JSON.stringify(detail));

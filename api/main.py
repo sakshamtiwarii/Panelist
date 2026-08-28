@@ -27,6 +27,7 @@ from api.auth import current_user, seed_demo_users
 from api.deps import (
     DEFAULT_DATASET,
     current_schedule,
+    dataset_is_usable,
     dataset_name,
     loaded_dataset,
     read_dataset_file,
@@ -81,6 +82,9 @@ def health():
         "has_schedule": cur is not None,
         "schedule_version": cur["version"] if cur else None,
         "store": store.kind,
+        # False when the stored dataset predates the current time model:
+        # a schedule exists but must be re-solved before it can be read.
+        "schedule_usable": dataset_is_usable(),
         "store_detail": store.describe(),
     }
 
@@ -142,6 +146,19 @@ def _restore_on_startup():
         ds = store.get_dataset(name)
         if ds is None:
             return
+
+        # A dataset persisted by an older build can be missing time-model keys.
+        # Adopting it anyway means every grid-touching endpoint 500s with no
+        # way back except knowing to re-solve; starting clean instead leaves
+        # the console in its ordinary "no schedule yet" state, where pressing
+        # Build fixes it.
+        stale = timegrid.missing_keys(ds.get("config"))
+        if stale:
+            print(f"[store] ignoring stored schedule for {name!r}: its config "
+                  f"predates the current time model (missing "
+                  f"{', '.join(stale)}). Re-solve to rebuild it.")
+            return
+
         set_loaded(name, ds)
         print(f"[store] restored schedule v{current['version']} "
               f"({len(current['scheduled'])} appointments) for {name!r}")

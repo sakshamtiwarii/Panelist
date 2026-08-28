@@ -30,6 +30,24 @@ def _require(config, key):
         ) from None
 
 
+# Every key the time model needs. Kept beside _require so the two cannot drift.
+REQUIRED_KEYS = (
+    "days", "slot_minutes", "usable_slots_per_day",
+    "slots_per_day_count", "slots_per_day_raw", "day_start_minutes",
+)
+
+
+def missing_keys(config):
+    """Which time-model keys a config lacks — empty tuple if it is usable.
+
+    Lets a caller test a config BEFORE building anything from it. Without this
+    the only way to discover a stale dataset is to hit the KeyError at request
+    time, which surfaces as a 500 on whichever endpoint happens to touch the
+    grid first.
+    """
+    return tuple(k for k in REQUIRED_KEYS if k not in (config or {}))
+
+
 def slots_per_day_raw(config):
     """Slots per day on the raw grid, including the (unusable) lunch band, so
     that absolute_slot = day * raw + slot_in_day stays simple."""

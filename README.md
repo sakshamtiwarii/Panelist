@@ -148,6 +148,19 @@ docker compose up
 - Dashboard: http://localhost:3000
 - Postgres: localhost:55432
 
+**Check the port before you open it.** Those are the defaults; if any was
+already taken on your machine, Docker published elsewhere and the URL above is
+wrong for you. `docker compose ps` is authoritative — the `dashboard` row shows
+the host port on the left of `->3000`:
+
+```
+dashboard   running   0.0.0.0:3001->3000/tcp     # open :3001, not :3000
+```
+
+The API allows requests from exactly the origin it published the dashboard on,
+so opening the wrong port fails every fetch with a CORS error rather than a
+404 — the console detects this case and says so, but it is worth knowing.
+
 These are the defaults; if you have a `.env` with port overrides (see below),
 use the ports it sets instead.
 

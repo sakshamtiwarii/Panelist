@@ -18,6 +18,7 @@ import os
 
 from fastapi import HTTPException
 
+from scheduler import timegrid
 from store import open_store
 
 DATA_ROOT = os.environ.get("PANELIST_DATA", "./data")
@@ -43,13 +44,42 @@ def dataset_name():
 
 
 def loaded_dataset():
-    """The live dataset as plain dicts, rebuilt from the store on a miss."""
+    """The live dataset as plain dicts, rebuilt from the store on a miss.
+
+    A dataset written by an older build can be missing time-model keys. Every
+    route reaches the store through here, so this is the one place that can
+    turn that into an actionable 409 — otherwise it surfaces as a bare 500
+    from whichever endpoint happens to touch the time grid first, with no hint
+    that re-solving fixes it.
+    """
     name = dataset_name()
     if not name:
         return None
     if _cache["dataset"] is None:
         _cache["dataset"] = store.get_dataset(name)
-    return _cache["dataset"]
+    ds = _cache["dataset"]
+    if ds is not None:
+        stale = timegrid.missing_keys(ds.get("config"))
+        if stale:
+            raise HTTPException(409, {
+                "error": "stored_dataset_outdated",
+                "message": (
+                    f"The stored dataset {name!r} predates the current time "
+                    f"model (missing {', '.join(stale)}). Re-solve to rebuild "
+                    f"it — POST /schedule, or press Build schedule."
+                ),
+                "missing": list(stale),
+            })
+    return ds
+
+
+def dataset_is_usable():
+    """Whether the live dataset can be read without re-solving."""
+    name = dataset_name()
+    if not name:
+        return True
+    ds = store.get_dataset(name) if _cache["dataset"] is None else _cache["dataset"]
+    return not timegrid.missing_keys((ds or {}).get("config"))
 
 
 def set_loaded(name, dataset):

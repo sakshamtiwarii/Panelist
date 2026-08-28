@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  ApiError, api,
+  API_BASE, ApiError, api, diagnoseReachability,
   type Appointment, type ConfigResponse, type Diagnostics,
   type DisruptionEvent, type Metrics, type Proposal, type Session,
   type SolverReport,
@@ -46,6 +46,9 @@ export default function Page() {
   const [churnCap, setChurnCap] = useState(10);
   const [focusStudent, setFocusStudent] = useState<string | null>(null);
   const [theme, setTheme] = useState<"system" | "light" | "dark">("system");
+  // "origin-rejected" means the API answered but refused this page's origin —
+  // almost always the wrong port, which otherwise looks like a dead backend.
+  const [reach, setReach] = useState<"unreachable" | "origin-rejected" | null>(null);
 
   // Explicit choice stamps the root; "system" removes the stamp and lets
   // prefers-color-scheme decide.
@@ -106,6 +109,7 @@ export default function Page() {
         if (h.has_schedule) await refresh();
       } catch (e) {
         setError(describeError(e));
+        if (isNetworkFailure(e)) setReach(await diagnoseReachability());
       }
     })();
   }, [session, refresh]);
@@ -246,21 +250,55 @@ export default function Page() {
   }
 
   if (error && !cfg) {
+    const origin = typeof window !== "undefined" ? window.location.origin : "";
     return (
       <div className="bare">
         <div className="bare-card">
-          <h2>Can&rsquo;t reach the scheduler</h2>
-          <p className="hint">
-            The console is running, but the API behind it isn&rsquo;t
-            answering. Start it and this page will connect on reload.
-          </p>
-          <ol className="steps">
-            <li>
-              Run <code>docker compose up</code> from the project root — or{" "}
-              <code>uvicorn main:app --port 8000</code> from <code>api/</code>.
-            </li>
-            <li>Reload this page.</li>
-          </ol>
+          {reach === "origin-rejected" ? (
+            <>
+              <h2>Wrong address for this console</h2>
+              <p className="hint">
+                The API at <code>{API_BASE}</code> is running, but it refuses
+                requests from <code>{origin}</code> — so the browser blocks
+                every response before this page can read it.
+              </p>
+              <p className="hint" style={{ marginTop: 10 }}>
+                This almost always means the dashboard is published on a
+                different port than the one you opened. Check which port
+                Docker published:
+              </p>
+              <ol className="steps">
+                <li>
+                  Run <code>docker compose ps</code> and look at the{" "}
+                  <code>dashboard</code> row — the host port is on the left of{" "}
+                  <code>-&gt;3000</code>.
+                </li>
+                <li>Open that address instead, then hard-reload.</li>
+                <li>
+                  A port override lives in <code>.env</code>{" "}
+                  (<code>PANELIST_WEB_PORT</code>); the API allows exactly that
+                  origin.
+                </li>
+              </ol>
+            </>
+          ) : (
+            <>
+              <h2>Can&rsquo;t reach the scheduler</h2>
+              <p className="hint">
+                The console is running, but nothing is answering at{" "}
+                <code>{API_BASE}</code>. Start it and this page will connect on
+                reload.
+              </p>
+              <ol className="steps">
+                <li>
+                  Run <code>docker compose up</code> from the project root — or{" "}
+                  <code>uvicorn api.main:app --port 8000</code> from the repo
+                  root.
+                </li>
+                <li>Reload this page.</li>
+              </ol>
+            </>
+          )}
           <p className="hint" style={{ marginTop: 4, color: "var(--ink-3)" }}>
             {error}
           </p>
@@ -540,6 +578,11 @@ export default function Page() {
       </div>
     </div>
   );
+}
+
+/** True for a network-level failure — no HTTP response came back at all. */
+function isNetworkFailure(e: unknown) {
+  return !(e instanceof ApiError);
 }
 
 function describeError(e: unknown) {
