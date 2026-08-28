@@ -11,24 +11,34 @@ believes 32 slots from 09:00.
 This module deliberately depends on nothing. The generator owns what the time
 model *is*; everything downstream only reads it back.
 
-The DEFAULT_* values exist for datasets generated before `slots_per_day_raw`
-and `day_start_minutes` were written into config, and can be dropped once
-those are regenerated.
+A dataset generated before these keys existed raises rather than falling back
+to the old 32/09:00 defaults. Substituting a default here would reintroduce
+exactly the failure this module removes: nothing crashes, and every appointment
+quietly renders at the wrong clock time. Regenerating the dataset is a second's
+work; a schedule that is subtly wrong is not detectable at all.
 """
 
-DEFAULT_SLOTS_PER_DAY_RAW = 32
-DEFAULT_DAY_START_MINUTES = 9 * 60
+
+def _require(config, key):
+    try:
+        return config[key]
+    except KeyError:
+        raise KeyError(
+            f"dataset config has no {key!r} — it predates the time model being "
+            f"written into config. Regenerate it: "
+            f"python -m generator.generate --out <dir> [...]"
+        ) from None
 
 
 def slots_per_day_raw(config):
     """Slots per day on the raw grid, including the (unusable) lunch band, so
     that absolute_slot = day * raw + slot_in_day stays simple."""
-    return config.get("slots_per_day_raw", DEFAULT_SLOTS_PER_DAY_RAW)
+    return _require(config, "slots_per_day_raw")
 
 
 def day_start_minutes(config):
     """Minutes past midnight at which each day's slot 0 begins."""
-    return config.get("day_start_minutes", DEFAULT_DAY_START_MINUTES)
+    return _require(config, "day_start_minutes")
 
 
 def horizon(config):

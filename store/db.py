@@ -14,6 +14,7 @@ died, and a live defense should not open with a connection error. `GET /health`
 reports which store is active, so the degradation is visible rather than silent.
 """
 
+import datetime
 import json
 import os
 import pathlib
@@ -93,6 +94,7 @@ class MemoryStore:
             "origin": origin,
             "solver_status": report.get("status") if report else None,
             "solve_seconds": report.get("wall_time_seconds") if report else None,
+            "created_at": datetime.datetime.now(datetime.timezone.utc),
             "metrics": metrics,
             "scheduled": scheduled,
             "unscheduled": list(unscheduled),
@@ -105,10 +107,21 @@ class MemoryStore:
         return versions[-1] if versions else None
 
     def versions(self, dataset):
-        return [
-            {k: v for k, v in e.items() if k not in ("scheduled", "unscheduled")}
-            for e in self._schedules.get(dataset, [])
-        ]
+        """Newest first, with the same keys PostgresStore returns.
+
+        The shape and the order are part of the API contract, not an accident
+        of how each store happens to hold its rows: /schedule/versions must not
+        answer differently depending on whether the database was reachable.
+        """
+        versions = self._schedules.get(dataset, [])
+        return [{
+            "version": e["version"],
+            "origin": e["origin"],
+            "solver_status": e["solver_status"],
+            "is_current": e["version"] == len(versions),
+            "created_at": e["created_at"].isoformat(),
+            "appointments": len(e["scheduled"]),
+        } for e in reversed(versions)]
 
     def current_dataset(self):
         for name, versions in self._schedules.items():

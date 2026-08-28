@@ -148,6 +148,9 @@ docker compose up
 - Dashboard: http://localhost:3000
 - Postgres: localhost:55432
 
+These are the defaults; if you have a `.env` with port overrides (see below),
+use the ports it sets instead.
+
 Then `POST /schedule` (or press **Build schedule** in the dashboard) to solve.
 A fresh clone has no dataset — `data/` is gitignored — so run the generator
 first, or `POST /generate`.
@@ -190,10 +193,20 @@ entirely and everything still runs, in memory.
 
 ```bash
 pip install -e ".[dev]"
-pytest tests/test_api.py             # ~3s, generates its own dataset
-python -m tests.test_replan_scenarios # ~4min, every disruption type
+pytest tests/test_api.py              # ~3s, generates its own dataset
+pytest tests/test_store_parity.py     # ~1s, both stores
+python -m tests.test_replan_scenarios # ~3.5min, every disruption type
 ruff check .
 ```
+
+`tests/test_store_parity.py` runs every case against **both** stores and
+asserts the same outcome. The in-memory fallback exists so the app survives an
+unreachable database, which means any behavioural difference between the two
+surfaces as a bug that appears only when the database is down — or only when it
+is up. It found one: `/schedule/versions` was returning a different order *and
+a different shape* depending on which store was active. Point
+`PANELIST_TEST_DATABASE_URL` at a server to include the Postgres half; without
+it, only the memory half runs.
 
 `tests/test_api.py` covers the boundaries the scenario suite cannot reach:
 authentication, the coordinator/viewer split, and the propose → apply
@@ -206,8 +219,11 @@ must hold whatever the solver decides: zero student clashes (recomputed
 independently), the model's own hard-constraint verification, and that
 interviews already under way are neither moved nor cancelled.
 
-Both run in CI (`.github/workflows/ci.yml`) alongside a dashboard typecheck
-and build.
+All of these run in CI (`.github/workflows/ci.yml`), which stands up a Postgres
+service for the parity suite and runs the replan scenarios as their own job
+with a larger solver budget — a CI runner has fewer cores than a dev machine,
+so the solver needs more wall-clock for the same result
+(`PANELIST_REPLAN_TIME_LIMIT`).
 
 To regenerate the dataset with a different seed/size:
 

@@ -1,0 +1,160 @@
+"""
+Panelist — the two stores must agree.
+
+`store/db.py` claims "two stores implement one interface", and the API relies
+on it: when Postgres is unreachable the app keeps serving from memory, so a
+behavioural difference between them shows up as a bug that only appears when
+the database is down (or only when it is up). Nothing checked that claim.
+
+Every test here runs against BOTH stores and asserts the same outcome. The
+Postgres half is skipped unless PANELIST_TEST_DATABASE_URL points at a server,
+so a laptop with no database still runs the suite; CI sets it.
+"""
+
+import os
+import uuid
+
+import pytest
+
+from store import MemoryStore, PostgresStore
+
+PG_URL = os.environ.get("PANELIST_TEST_DATABASE_URL")
+
+
+@pytest.fixture(params=["memory", "postgres"])
+def store(request):
+    if request.param == "memory":
+        yield MemoryStore()
+        return
+    if not PG_URL:
+        pytest.skip("PANELIST_TEST_DATABASE_URL not set")
+    s = PostgresStore(PG_URL)
+    s.init_schema()
+    yield s
+    s.close()
+
+
+@pytest.fixture
+def dataset_name():
+    # Unique per test: the stores are dataset-scoped, so parallel or repeated
+    # runs never collide and nothing needs tearing down.
+    return f"t{uuid.uuid4().hex[:12]}"
+
+
+@pytest.fixture(scope="session")
+def sample():
+    """A small real dataset and a solved schedule for it.
+
+    Generated and solved here rather than read from ./data, which is gitignored:
+    depending on it would make this suite fail on a fresh clone and quietly
+    couple it to whatever a previous CI step happened to leave behind.
+    """
+    from generator.generate import build_dataset
+    from scheduler.model import SchedulingModel
+
+    ds, _ = build_dataset(seed=42, companies=6, students=40, rooms=3, days=4)
+    model = SchedulingModel(
+        ds["companies"], ds["students"], ds["rooms"], ds["config"]
+    ).build()
+    _, solver = model.solve(time_limit_seconds=20)
+    scheduled, _ = model.extract_schedule(solver)
+    return ds, scheduled
+
+
+def test_no_schedule_yet(store, dataset_name):
+    assert store.get_current(dataset_name) is None
+    assert store.versions(dataset_name) == []
+
+
+def test_schedules_are_versioned_not_mutated(store, dataset_name, sample):
+    ds, sched = sample
+    store.put_dataset(dataset_name, ds)
+
+    v1 = store.put_schedule(dataset_name, sched, [], {"status": "OPTIMAL"}, {})
+    v2 = store.put_schedule(dataset_name, sched[:10], ["x"],
+                            {"status": "FEASIBLE"}, {}, origin="replan")
+    assert (v1, v2) == (1, 2)
+
+    current = store.get_current(dataset_name)
+    assert current["version"] == 2
+    assert current["origin"] == "replan"
+    assert len(current["scheduled"]) == 10
+    assert current["unscheduled"] == ["x"]
+
+    # Newest first, and the older version survives the newer one.
+    rows = store.versions(dataset_name)
+    assert [v["version"] for v in rows] == [2, 1]
+    # The response shape is part of the API contract: /schedule/versions must
+    # not answer differently depending on whether the database was reachable.
+    assert set(rows[0]) == {"version", "origin", "solver_status",
+                            "is_current", "created_at", "appointments"}
+    assert (rows[0]["is_current"], rows[1]["is_current"]) == (True, False)
+    assert rows[0]["appointments"] == 10 and rows[1]["appointments"] == 84
+
+
+def test_dataset_round_trips(store, dataset_name, sample):
+    ds, _ = sample
+    store.put_dataset(dataset_name, ds)
+    back = store.get_dataset(dataset_name)
+    assert {c["id"] for c in back["companies"]} == {c["id"] for c in ds["companies"]}
+    assert len(back["students"]) == len(ds["students"])
+    assert len(back["rooms"]) == len(ds["rooms"])
+    # The shortlist relation must survive, not just the sizes.
+    by_id = {c["id"]: c for c in back["companies"]}
+    for c in ds["companies"]:
+        assert sorted(by_id[c["id"]]["shortlist"]) == sorted(c["shortlist"])
+    # The time model must come back intact, or the solver silently regrids.
+    assert back["config"]["slots_per_day_raw"] == ds["config"]["slots_per_day_raw"]
+    assert back["config"]["day_start_minutes"] == ds["config"]["day_start_minutes"]
+
+
+def test_current_dataset_finds_the_live_one(store, dataset_name, sample):
+    ds, sched = sample
+    assert store.current_dataset() is None or True   # may hold other datasets
+    store.put_dataset(dataset_name, ds)
+    store.put_schedule(dataset_name, sched, [], {"status": "OPTIMAL"}, {})
+    assert store.current_dataset() is not None
+
+
+def test_proposals_round_trip_and_clear(store, dataset_name):
+    payload = {"ok": True, "diff": {"moved": []}, "nested": {"a": [1, 2, 3]}}
+    store.put_proposal("p1", dataset_name, payload, ttl_minutes=30)
+    assert store.get_proposal("p1") == payload
+    assert store.get_proposal("missing") is None
+
+    store.clear_proposals(dataset_name)
+    assert store.get_proposal("p1") is None
+
+
+def test_expired_proposals_are_invisible(store, dataset_name):
+    store.put_proposal("old", dataset_name, {"ok": True}, ttl_minutes=-1)
+    assert store.get_proposal("old") is None
+
+
+def test_affected_counts_other_interviews_that_day(store, dataset_name, sample):
+    ds, sched = sample
+    store.put_dataset(dataset_name, ds)
+    store.put_schedule(dataset_name, sched, [], {"status": "OPTIMAL"}, {})
+
+    company = sched[0]["company_id"]
+    day = sched[0]["day"]
+    rows = store.affected(dataset_name, company_id=company, day=day)
+    assert rows, "the disruption hits at least the interview it was taken from"
+    for r in rows:
+        assert r["interviews_hit"] >= 1
+        assert r["other_interviews_that_day"] >= 0
+        # The correlated count must exclude the hit interviews themselves.
+        same_day = [a for a in sched
+                    if a["student_id"] == r["student_id"] and a["day"] == day]
+        assert r["other_interviews_that_day"] == len(same_day) - r["interviews_hit"]
+
+
+def test_users_round_trip(store):
+    salt, digest = b"0123456789abcdef", b"x" * 32
+    store.put_user("someone", "Some One", "viewer", salt, digest)
+    u = store.get_user("someone")
+    assert u["role"] == "viewer" and u["display_name"] == "Some One"
+    # Bytes must come back as bytes, or password verification silently fails.
+    assert u["salt"] == salt and u["password_hash"] == digest
+    assert store.get_user("nobody") is None
+    store.touch_login("someone")

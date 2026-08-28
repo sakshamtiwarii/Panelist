@@ -25,7 +25,8 @@ from replanner.run import build_scenarios
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 NOW_SLOT = 48  # mid Day 2
-DATA = os.path.join(ROOT, "data", "primary")
+DATA = os.environ.get("PANELIST_REPLAN_DATA",
+                      os.path.join(ROOT, "data", "primary"))
 
 # CP-SAT runs 8 workers in parallel, so its *wall-clock* limit makes solve time
 # nondeterministic: the compound scenario has been measured between 16s and 37s
@@ -33,7 +34,11 @@ DATA = os.path.join(ROOT, "data", "primary")
 # hard constraints hold, locks respected), never solver speed, so the budget is
 # set well clear of the observed worst case. A tighter one makes a *different*
 # scenario fail on each run, which reads like a real regression and is not one.
-TIME_LIMIT = 120
+#
+# Overridable because the headroom needed scales with the machine: a 2-core CI
+# runner gives the solver a quarter of the workers a dev laptop does, so CI
+# raises this rather than inheriting a budget tuned on faster hardware.
+TIME_LIMIT = float(os.environ.get("PANELIST_REPLAN_TIME_LIMIT", 120))
 
 
 def main():
