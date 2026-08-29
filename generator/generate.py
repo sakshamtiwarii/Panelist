@@ -214,7 +214,7 @@ def scale_shortlist_sizes(companies, rooms, days, config, load_factor):
         scale = (load_factor * capacity_slots) / demand_slots
 
     for c in companies:
-        c["shortlist_size"] = max(5, int(round(c["_raw_size"] * scale)))
+        c["shortlist_size"] = max(5, round(c["_raw_size"] * scale))
         del c["_raw_size"]
     return capacity_slots
 

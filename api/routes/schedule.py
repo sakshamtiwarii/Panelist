@@ -89,7 +89,7 @@ def create_schedule(req: ScheduleRequest, _=Depends(require_coordinator)):
     scheduled, unscheduled = model.extract_schedule(solver)
     errors = model.verify_schedule(scheduled)
     metrics = compute_metrics(
-        scheduled, unscheduled, ds["students"], ds["rooms"], ds["config"]
+        scheduled, unscheduled, ds["rooms"], ds["config"]
     )
     store.put_dataset(req.dataset, ds)
     version = store.put_schedule(
@@ -141,7 +141,7 @@ def get_metrics(_=Depends(current_user)):
     cur = current_schedule()
     return compute_metrics(
         cur["scheduled"], [{"id": i} for i in cur["unscheduled"]],
-        ds["students"], ds["rooms"], ds["config"],
+        ds["rooms"], ds["config"],
     )
 
 

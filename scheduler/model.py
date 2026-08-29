@@ -63,6 +63,20 @@ PROTECT_BONUS = 100
 DEPRIORITISED_WEIGHT = 1
 
 
+def panels_available(company, at):
+    """Panels a company still has running at one instant.
+
+    A blackout removes a panel from part of the week rather than lowering the
+    count for all of it, so "how many panels" is a question about a moment.
+    Shared with the replanner's lock validation, which asks exactly the same
+    question of an already-run schedule — the arithmetic was duplicated, and
+    the two copies have to agree or a replan is validated against different
+    capacity than it is verified against.
+    """
+    out = sum(1 for w0, w1 in company.get("panel_blackouts", []) if w0 <= at < w1)
+    return max(0, company["panel_count"] - out)
+
+
 class SchedulingModel:
     def __init__(
         self,
@@ -185,7 +199,8 @@ class SchedulingModel:
         dur = interview["duration_slots"]
         return [
             s for s in starts
-            if not any(s < w1 and s + dur > w0 for w0, w1 in windows)
+            if not any(timegrid.overlaps(s, s + dur, w0, w1)
+                       for w0, w1 in windows)
         ]
 
     # -- model construction -------------------------------------------------
@@ -386,11 +401,10 @@ class SchedulingModel:
         instance schedules everything, an oversubscribed one returns the best
         partial schedule plus an attributed shortfall.
         """
-        terms = []
-        for iv in self.interviews:
-            terms.append(
-                self.interview_weight(iv) * self.present[iv["id"]]
-            )
+        terms = [
+            self.interview_weight(iv) * self.present[iv["id"]]
+            for iv in self.interviews
+        ]
 
         for cid, level in sorted(self.priority_overrides.items()):
             company = self.company_by_id.get(cid)
@@ -547,7 +561,7 @@ class SchedulingModel:
         by_company = defaultdict(list)
         for a in scheduled:
             by_company[a["company_id"]].append(a)
-        for _cid, items in by_company.items():
+        for items in by_company.values():
             free_at = []  # panel index -> slot it frees up
             for a in sorted(items, key=lambda x: x["start"]):
                 # Same stability preference as rooms: keep the prior panel
@@ -594,11 +608,17 @@ class SchedulingModel:
             return
         self._exact_rooms(scheduled)
 
+    def _room_free(self, blocked, rid, lo, hi):
+        """Is room `rid` clear of a blocking window over [lo, hi)?
+
+        A method rather than a closure defined identically in both the greedy
+        and the exact assignment: the two must agree about what "blocked"
+        means, and two copies of the predicate is how they stop agreeing.
+        """
+        return not any(timegrid.overlaps(lo, hi, b0, b1) for b0, b1 in blocked[rid])
+
     def _greedy_rooms(self, scheduled):
         blocked = self._blocked_windows()
-
-        def is_blocked(rid, lo, hi):
-            return any(not (hi <= b0 or lo >= b1) for b0, b1 in blocked[rid])
 
         free_at = {r["id"]: 0 for r in self.rooms}
         ok = True
@@ -614,8 +634,8 @@ class SchedulingModel:
                 candidates.insert(0, prior)
 
             for rid in candidates:
-                if free_at[rid] <= a["start"] and not is_blocked(
-                    rid, a["start"], a["end"]
+                if free_at[rid] <= a["start"] and self._room_free(
+                    blocked, rid, a["start"], a["end"]
                 ):
                     free_at[rid] = a["end"]
                     a["room"] = rid
@@ -632,15 +652,12 @@ class SchedulingModel:
         blocked = self._blocked_windows()
         room_ids = [r["id"] for r in self.rooms]
 
-        def is_blocked(rid, lo, hi):
-            return any(not (hi <= b0 or lo >= b1) for b0, b1 in blocked[rid])
-
         m = cp_model.CpModel()
         var = {}
         for a in scheduled:
             allowed = [
                 i for i, rid in enumerate(room_ids)
-                if not is_blocked(rid, a["start"], a["end"])
+                if self._room_free(blocked, rid, a["start"], a["end"])
             ]
             var[a["id"]] = m.NewIntVarFromDomain(
                 cp_model.Domain.FromValues(allowed), f"room_{a['id']}"
@@ -786,8 +803,8 @@ class SchedulingModel:
         d1, s1 = timegrid.split(self.config, w1)
         if s1 == 0 and d1 > d0:
             d1, s1 = d1 - 1, self.slots_raw
-        start = f"Day {d0 + 1} {timegrid.clock(self.config, s0)}"
-        end = f"Day {d1 + 1} {timegrid.clock(self.config, s1)}"
+        start = timegrid.stamp(self.config, d0, s0)
+        end = timegrid.stamp(self.config, d1, s1)
         return start if start == end else f"{start}\u2009\u2013\u2009{end}"
 
     def diagnose_unscheduled(self, scheduled, unscheduled):
@@ -998,14 +1015,14 @@ class SchedulingModel:
             rid = a.get("room")
             if rid is not None:
                 for b0, b1 in blocked[rid]:
-                    if a["start"] < b1 and a["end"] > b0:
+                    if timegrid.overlaps(a["start"], a["end"], b0, b1):
                         errors.append(
                             f"{a['id']}: room {rid} is blocked over "
                             f"{self._window_label(b0, b1)}"
                         )
             company = self.company_by_id[a["company_id"]]
             for w0, w1 in company.get("unavailable_windows", []):
-                if a["start"] < w1 and a["end"] > w0:
+                if timegrid.overlaps(a["start"], a["end"], w0, w1):
                     errors.append(
                         f"{a['id']}: {company['name']} is unavailable over "
                         f"{self._window_label(w0, w1)}"
@@ -1020,15 +1037,12 @@ class SchedulingModel:
             by_company[a["company_id"]].append(a)
         for cid, items in by_company.items():
             company = self.company_by_id[cid]
-            blackouts = company.get("panel_blackouts", [])
-            if not blackouts:
+            if not company.get("panel_blackouts"):
                 continue
             for probe in items:
                 at = probe["start"]
                 concurrent = sum(1 for o in items if o["start"] <= at < o["end"])
-                available = company["panel_count"] - sum(
-                    1 for w0, w1 in blackouts if w0 <= at < w1
-                )
+                available = panels_available(company, at)
                 if concurrent > available:
                     errors.append(
                         f"{company['name']}: {concurrent} interview(s) "

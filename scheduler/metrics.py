@@ -16,7 +16,7 @@ metrics sacrificed first.
 from collections import defaultdict
 
 
-def compute_metrics(scheduled, unscheduled, students, rooms, config):
+def compute_metrics(scheduled, unscheduled, rooms, config):
     total = len(scheduled) + len(unscheduled)
     slot_minutes = config["slot_minutes"]
     capacity_slots = (
@@ -41,7 +41,7 @@ def compute_metrics(scheduled, unscheduled, students, rooms, config):
         by_student[a["student_id"]].append(a)
     clashes = 0
     gaps = []
-    for _sid, items in by_student.items():
+    for items in by_student.values():
         items.sort(key=lambda x: x["start"])
         for a, b in zip(items, items[1:]):
             if b["start"] < a["end"]:

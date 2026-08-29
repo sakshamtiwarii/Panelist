@@ -158,7 +158,7 @@ def commit_replan(req: ApplyRequest, _=Depends(require_coordinator)):
 
     metrics = compute_metrics(
         schedule, [{"id": i} for i in proposal["unscheduled"]],
-        ds["students"], ds["rooms"], ds["config"],
+        ds["rooms"], ds["config"],
     )
     version = store.put_schedule(
         name, schedule, proposal["unscheduled"],
