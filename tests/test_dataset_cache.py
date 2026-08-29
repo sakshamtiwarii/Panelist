@@ -1,20 +1,11 @@
-"""
-Panelist — the API's dataset cache must not outlive its dataset.
+"""The API's dataset cache must not outlive its dataset.
 
-`api/deps` caches the live dataset as plain dicts because the solver wants
-dicts and rebuilding them from the tables on every solve is pure overhead. The
-cache had no invalidation at all: once a worker had read a dataset it held that
-copy forever.
+`api/deps` caches the live dataset as plain dicts. Under `uvicorn --workers N`
+only the worker that applies a replan updates its own cache, so every other one
+would serve the pre-amendment roster until it noticed the version had moved.
 
-Single-worker that is invisible, because the worker that applies a replan is
-also the one that updates its own cache. Run under `uvicorn --workers N` — the
-configuration the store exists to support — and every OTHER worker serves the
-pre-amendment roster for the rest of its life: a company added by a replan
-never appears in its /config, and a replan it computes is built from a roster
-that no longer exists.
-
-These drive `api.deps` against a store that changes underneath it, which is
-what a second worker looks like from inside the first.
+These tests drive `api.deps` against a store that changes underneath it, which
+is what a second worker looks like from inside the first.
 """
 
 import pytest

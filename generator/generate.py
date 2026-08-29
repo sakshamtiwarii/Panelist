@@ -1,8 +1,4 @@
-"""
-Panelist — dataset generator.
-
-Produces realistic, seeded companies/students/rooms data for the
-placement week scheduling problem.
+"""Seeded generator for companies/students/rooms placement-week datasets.
 
 Usage:
     python -m generator.generate --seed 42 --companies 35 --students 800 \
@@ -12,25 +8,19 @@ Usage:
     python -m generator.generate --seed 42 --load-factor 1.15 \
         --out ./data/oversubscribed
 
-Realism requirements (see PLACEMENT_SCHEDULER_GUIDE.md section 2.1):
-- Company shortlist sizes are heavy-tailed, not uniform: a few mass recruiters
-  shortlist 280-400, a mid band sits at 60-150, and a long tail runs 18-45.
-  Sizes are banded by tier with Pareto jitter inside each band, which matches
-  the bimodal shape the spec describes better than one smooth curve does.
-- High-CGPA students appear on many overlapping shortlists. Shortlist
-  membership is sampled with a weight superlinear in (cgpa - cutoff), so the
-  top of the cohort is contended over by many companies at once. This is what
-  creates the actual scheduling conflicts the assignment is about.
-- Priority tiers correlate with scheduling day: mass recruiters (large
-  shortlists, low cutoffs, many panels) cluster on Day 1; niche high-cutoff
-  companies with small headcounts land later in the week.
+The generated instance is deliberately hard:
+- Shortlist sizes are heavy-tailed, banded by tier with Pareto jitter — a few
+  mass recruiters at 280-400, a mid band at 60-150, a long tail at 18-45.
+- Shortlist membership is weighted superlinearly in (cgpa - cutoff), so
+  high-CGPA students land on many overlapping shortlists and their interviews
+  compete for the same slots.
+- Tier correlates with day: mass recruiters cluster on Day 1, niche
+  high-cutoff companies land later in the week.
 
-Instance difficulty: at natural sizes (no --load-factor) 800 students over
-20 rooms x 4 days is oversubscribed roughly 2.5x -- which is the honest answer
-to "can you interview every shortlisted student in one placement week", and is
-why the spec says infeasibility "will" happen. Pass --load-factor to scale
-demand down (0.9 = hard but fully solvable) for a demo where every interview
-lands. Scaling is multiplicative, so the size shape is preserved either way.
+At natural sizes (no --load-factor) 800 students over 20 rooms x 4 days is
+oversubscribed roughly 2.5x. Pass --load-factor to scale demand down
+(0.9 = hard but fully solvable); scaling is multiplicative, so the size shape
+is preserved either way.
 """
 
 import argparse
@@ -52,16 +42,9 @@ BRANCHES = ["CSE", "IT", "ECE", "EEE", "MECH", "CIVIL", "CHEM"]
 # Companies skew toward hiring from these; used for mild branch affinity.
 TECH_BRANCHES = {"CSE", "IT", "ECE"}
 
-# Ordered by expected campus hiring volume, because tier is assigned by RANK:
-# the first ~10% become the mass recruiters, the next 30% mid-size, the rest
-# niche. That ordering makes the generated structure match how an Indian
-# placement week actually runs — the IT services firms mass-hire on Day 1 with
-# low cutoffs and many panels, while the high-paying product and quant firms
-# take a handful of top-CGPA students later in the week.
-#
-# Real names are used because they carry that structure intuitively: a reader
-# knows what a TCS drive looks like versus a Jane Street one. The data itself
-# — students, shortlists, cutoffs, panel counts — is entirely synthetic.
+# Ordered by expected campus hiring volume, because tier is assigned by rank:
+# the first ~10% become mass recruiters, the next 30% mid-size, the rest niche.
+# The names are real; everything generated about them is synthetic.
 COMPANY_NAMES = [
     # Mass recruiters: very large shortlists, low cutoffs, many panels.
     "TCS", "Infosys", "Cognizant", "Wipro",
@@ -126,11 +109,9 @@ def build_config(days):
         ],
         "usable_slots_per_day": slots,
         "slots_per_day_count": len(slots),
-        # The raw grid (lunch included) and the day's origin. Written here so
-        # the dataset carries its whole time model: every reader derives slot
-        # arithmetic from config via scheduler.timegrid instead of keeping a
-        # private copy that a change to the hours above would silently
-        # invalidate.
+        # The raw grid (lunch included) and the day's origin, so the dataset
+        # carries its whole time model and every reader can derive slot
+        # arithmetic from config via scheduler.timegrid.
         "slots_per_day_raw": (DAY_END_MIN - DAY_START_MIN) // SLOT_MINUTES,
         "day_start_minutes": DAY_START_MIN,
     }
@@ -141,11 +122,8 @@ def build_config(days):
 def generate_companies(rng, n, days):
     """Companies, ranked by shortlist size, with tier/day/cutoff correlated.
 
-    Sizes are bimodal by tier rather than a single smooth curve, because that
-    is what the spec actually describes and what a real placement week looks
-    like: a few mass recruiters shortlisting 300+, a mid band, then a long
-    tail at 20-40. Pareto jitter within each band keeps sizes from being
-    suspiciously round.
+    Sizes are bimodal by tier rather than one smooth curve, with Pareto jitter
+    inside each band so they are not suspiciously round.
     """
     names = (COMPANY_NAMES * (n // len(COMPANY_NAMES) + 1))[:n]
 
@@ -171,8 +149,8 @@ def generate_companies(rng, n, days):
             panels = rng.randint(3, 7)
             duration = rng.choice([30, 30, 45])
         else:
-            # Niche companies land later in the week — but a one-day week has
-            # no "later", and randint(1, 0) is an error rather than a choice.
+            # Niche companies land later in the week; `min` keeps a one-day
+            # week from reaching randint(1, 0).
             tier, day_bias = 3, rng.randint(min(1, days - 1), days - 1)
             raw_size = banded(18, 45)
             cutoff = rng.uniform(7.6, 9.0)
@@ -197,13 +175,9 @@ def generate_companies(rng, n, days):
 def scale_shortlist_sizes(companies, rooms, days, config, load_factor):
     """Optionally scale shortlist sizes to hit a target room-capacity load.
 
-    With load_factor None (the default) sizes are left at their natural,
-    spec-realistic values -- which at 20 rooms x 4 days is oversubscribed.
-    That is the honest instance: the spec says infeasibility "will" happen,
-    and a realistic placement week genuinely cannot interview everyone.
-    Pass an explicit --load-factor to scale demand down to a fully solvable
-    instance for demos. Scaling is multiplicative, so the size *shape* is
-    preserved -- only the difficulty moves.
+    With load_factor None sizes keep their natural values, which at 20 rooms x
+    4 days is oversubscribed. Scaling is multiplicative, so only the difficulty
+    moves, not the shape of the distribution.
     """
     capacity_slots = rooms * config["slots_per_day_count"] * days
     demand_slots = sum(c["_raw_size"] * c["duration_slots"] for c in companies)
@@ -248,8 +222,7 @@ def assign_shortlists(rng, students, companies):
 
     This is the correlation that makes the instance hard: the same high-CGPA
     students get drawn onto many shortlists, so their interviews compete for
-    the same slots. Uniform sampling here would make the problem trivial and
-    is explicitly graded down (guide section 2.1).
+    the same slots. Uniform sampling would make the problem trivial.
     """
     by_id = {s["id"]: s for s in students}
 
@@ -331,11 +304,7 @@ def _pearson(xs, ys):
 
 
 def conflict_density_report(companies, students, rooms, config, capacity_slots):
-    """Confirm the instance is actually hard BEFORE any solver code runs.
-
-    Checks the three realism properties the spec grades, plus the capacity
-    pressure points the scheduler will have to resolve.
-    """
+    """Confirm the instance is actually hard before any solver code runs."""
     sizes = sorted((c["shortlist_size"] for c in companies), reverse=True)
     counts = [len(s["shortlisted_by"]) for s in students]
     contended = [s for s in students if len(s["shortlisted_by"]) >= 5]
@@ -426,15 +395,10 @@ def build_dataset(seed=42, companies=35, students=800, rooms=20, days=4,
                   load_factor=None):
     """Generate a dataset in memory. Returns (dataset, density_report).
 
-    Kept separate from file writing and from argparse so the API can call it
-    directly. Spawning `python generator/generate.py` instead would tie the
-    endpoint to the process's working directory and reduce every failure to a
-    truncated stderr string.
+    Separate from file writing and argparse so the API can call it directly.
     """
-    # Validated here, in one place: every downstream step assumes a non-empty
-    # cohort, and without this the failure surfaces as an IndexError or a
-    # ZeroDivisionError from deep inside the density report — a 500 with a
-    # traceback where the real answer is "that instance has no companies".
+    # Every downstream step assumes a non-empty cohort; without this the
+    # failure surfaces as an IndexError from inside the density report.
     for label, value in (("companies", companies), ("students", students),
                          ("rooms", rooms), ("days", days)):
         if value < 1:
@@ -474,12 +438,7 @@ def build_dataset(seed=42, companies=35, students=800, rooms=20, days=4,
 
 
 def write_dataset(out, dataset, report):
-    """Write the dataset and its density report to `out/`.
-
-    `dataset.json` alone — it already contains the companies, students and
-    rooms. This used to also emit those three as separate files, which nothing
-    in the project ever read back.
-    """
+    """Write the dataset and its density report to `out/`."""
     os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, "dataset.json"), "w") as f:
         json.dump(dataset, f, indent=2)

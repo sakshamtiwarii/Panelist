@@ -1,17 +1,12 @@
-"""
-Panelist — the independent re-check of a produced schedule.
+"""The independent re-check of a produced schedule.
 
 `verify_schedule` exists because the solver is trusted but the greedy
-room/panel colouring that recovers concrete assignments is not. It claimed to
-"independently re-check every hard constraint" while checking only overlap and
-CGPA cutoffs — so the two constraints the colouring is most likely to get
-wrong, blocked room windows and company availability, were the two it never
-looked at. Panel blackouts were invisible for the same reason: the colouring
-assigns indices without knowing a panel walked out.
+room/panel colouring that recovers concrete assignments is not — blocked room
+windows, company availability and panel blackouts are what that colouring is
+most likely to get wrong.
 
-Each test drives a violation the solver would never produce, because the point
-is to catch the extraction disagreeing with the model, not to re-test the
-solver.
+Each test drives a violation the solver would never produce: the point is to
+catch the extraction disagreeing with the model, not to re-test the solver.
 """
 
 import pytest

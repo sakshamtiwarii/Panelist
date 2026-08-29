@@ -1,11 +1,8 @@
-"""
-Panelist — the generator's input contract.
+"""The generator's input contract.
 
 `POST /generate` takes its numbers straight from a request body, so every
-degenerate combination is reachable from outside. They used to surface from
-deep inside the density report — `days=1` as `randint(1, 0)`, an empty cohort
-as an IndexError on `sizes[0]` — which reaches the caller as a 500 with a
-traceback when the real answer is "that instance has no companies".
+degenerate combination is reachable from outside and must come back as a 400
+naming the bad setting rather than a 500 from deep inside the density report.
 """
 
 import pytest

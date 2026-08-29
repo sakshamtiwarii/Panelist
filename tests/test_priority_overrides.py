@@ -1,21 +1,15 @@
-"""
-Panelist — the coordinator's exceptions to the tier default.
+"""The coordinator's exceptions to the tier default.
 
-Guide section 4, question 2: "you decide the algorithm's default behavior, the
-coordinator decides exceptions." The default is the tier weighting — when an
-oversubscribed instance cannot place everything, tier-1 mass recruiters win.
-That is a policy decision, and the guide is explicit that a company must not be
-deprioritised silently by code with no way for a human to say otherwise.
+The default is the tier weighting: when an oversubscribed instance cannot place
+everything, tier-1 mass recruiters win. An override lifts a company above that
+order or drops it below.
 
-The README claimed this control existed before it did; these tests are what
-make the claim true.
-
-Most of them assert on `interview_weight` rather than on a solve. The claims
-are exact — a protected interview outranks any tier difference, a deprioritised
-one yields to everything — and an oversubscribed instance does not prove
+Most tests assert on `interview_weight` rather than on a solve. The claims are
+exact — a protected interview outranks any tier difference, a deprioritised one
+yields to everything — while an oversubscribed instance does not prove
 optimality inside a test-sized budget, so asserting on placement counts would
 test the solver's time limit as much as the feature. One integration test
-covers the wiring: that the weights really do reach the schedule.
+covers the wiring.
 """
 
 import pytest

@@ -3,36 +3,41 @@
 import { useState } from "react";
 import type { Company, DisruptionEvent, Room } from "@/lib/api";
 import type { Clock } from "@/lib/time";
+import Icon, { type IconName } from "./Icon";
 
 /**
  * Event composer — disruptions and roster changes.
  *
- * Events are queued rather than fired one at a time, because the injection
- * this is built for is compound — a late recruiter AND a dropped panel AND a
- * batch of withdrawals, resolved as one replan. Firing them singly would
- * produce three separate reshuffles and triple the churn.
+ * Events are queued rather than fired one at a time: a real disruption is
+ * compound (a late recruiter and a dropped panel and a batch of withdrawals),
+ * and resolving them as one replan moves far fewer interviews than three
+ * separate reshuffles.
  *
- * Roster edits sit in the same queue and travel the same path. Mechanically
- * they are identical to a disruption: both change the problem input and both
- * must be costed before they are committed. They are grouped separately only
- * because they differ in intent — one is an accident, the other a decision —
- * and a coordinator reaching for "a company pulled out" is not in the same
- * frame of mind as one reaching for "add a late registration".
+ * Roster edits share the queue and the path — both change the problem input and
+ * both must be costed before they are committed. They are grouped separately
+ * only because they differ in intent.
  */
 
-const DISRUPTIONS = [
-  { id: "company_late", label: "Running late", hint: "company arrives late" },
-  { id: "panel_drop", label: "Panel leaves", hint: "an interviewer drops" },
-  { id: "student_withdraw", label: "Student out", hint: "accepted an offer" },
-  { id: "room_unavailable", label: "Room lost", hint: "venue unusable" },
-] as const;
+type Kind = {
+  id: string;
+  label: string;
+  hint: string;
+  icon: IconName;
+};
 
-const ROSTER = [
-  { id: "company_add", label: "Add company", hint: "late registration" },
-  { id: "company_remove", label: "Drop company", hint: "pulled out" },
-  { id: "shortlist_add", label: "Add student", hint: "to a shortlist" },
-  { id: "shortlist_remove", label: "Drop student", hint: "from a shortlist" },
-] as const;
+const DISRUPTIONS: readonly Kind[] = [
+  { id: "company_late", label: "Running late", hint: "company arrives late", icon: "late" },
+  { id: "panel_drop", label: "Panel leaves", hint: "an interviewer drops", icon: "panel" },
+  { id: "student_withdraw", label: "Student out", hint: "accepted an offer", icon: "student" },
+  { id: "room_unavailable", label: "Room lost", hint: "venue unusable", icon: "room" },
+];
+
+const ROSTER: readonly Kind[] = [
+  { id: "company_add", label: "Add company", hint: "late registration", icon: "plus" },
+  { id: "company_remove", label: "Drop company", hint: "pulled out", icon: "minus" },
+  { id: "shortlist_add", label: "Add student", hint: "to a shortlist", icon: "userPlus" },
+  { id: "shortlist_remove", label: "Drop student", hint: "from a shortlist", icon: "userMinus" },
+];
 
 interface Props {
   companies: Company[];
@@ -88,8 +93,8 @@ export default function DisruptionPanel({
         break;
       case "room_unavailable":
         Object.assign(base, {
-          // The whole day, from the grid the API reported — a literal 32 is
-          // only right while the day happens to be 09:00-17:00 in 15min slots.
+          // The whole day, from the grid the API reported rather than a
+          // literal that assumes 09:00-17:00 in 15-minute slots.
           room_id: roomId, day, from_slot: 0, to_slot: clock.raw,
           reason: "became unavailable",
         });
@@ -131,7 +136,7 @@ export default function DisruptionPanel({
      "room_unavailable"].includes(kind);
   const needsSlot = ["panel_drop", "student_withdraw"].includes(kind);
 
-  const KindGrid = ({ items }: { items: readonly typeof DISRUPTIONS[number][] | readonly typeof ROSTER[number][] }) => (
+  const KindGrid = ({ items }: { items: readonly Kind[] }) => (
     <div className="kind-grid">
       {items.map((k) => (
         <button
@@ -140,8 +145,11 @@ export default function DisruptionPanel({
           aria-pressed={kind === k.id}
           onClick={() => { setKind(k.id); setError(null); }}
         >
-          {k.label}
-          <small>{k.hint}</small>
+          <Icon name={k.icon} size={15} className="kind-ico" />
+          <span>
+            {k.label}
+            <small>{k.hint}</small>
+          </span>
         </button>
       ))}
     </div>
@@ -150,10 +158,13 @@ export default function DisruptionPanel({
   return (
     <>
       <div className="rail-section">
-        <span className="label">1 · What happened?</span>
+        <div className="step-head on">
+          <span className="step-n">1</span>
+          <span className="step-t">What happened?</span>
+        </div>
         <KindGrid items={DISRUPTIONS} />
 
-        <span className="label" style={{ display: "block", margin: "14px 0 8px" }}>
+        <span className="label" style={{ display: "block", margin: "15px 0 8px" }}>
           Or change the roster
         </span>
         <KindGrid items={ROSTER} />
@@ -165,6 +176,7 @@ export default function DisruptionPanel({
             <span className="label">Company</span>
             <select
               className="select"
+              aria-label="Company"
               value={companyId}
               onChange={(e) => setCompanyId(e.target.value)}
             >
@@ -179,8 +191,7 @@ export default function DisruptionPanel({
             </select>
             {kind === "shortlist_add" && (
               <p className="hint" style={{ marginTop: 5 }}>
-                Students below this cutoff are refused — it is a business rule,
-                not a preference.
+                Students below this cutoff are refused.
               </p>
             )}
           </div>
@@ -192,6 +203,7 @@ export default function DisruptionPanel({
               <span className="label">Company name</span>
               <input
                 className="input"
+                aria-label="Company name"
                 placeholder="Jane Street"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
@@ -202,6 +214,7 @@ export default function DisruptionPanel({
                 <span className="label">CGPA cutoff</span>
                 <input
                   className="input" type="number" step={0.1} min={5} max={10}
+                  aria-label="CGPA cutoff"
                   value={cutoff}
                   onChange={(e) => setCutoff(Number(e.target.value))}
                 />
@@ -210,6 +223,7 @@ export default function DisruptionPanel({
                 <span className="label">Shortlist</span>
                 <input
                   className="input" type="number" min={1}
+                  aria-label="Shortlist size"
                   value={size}
                   onChange={(e) => setSize(Number(e.target.value))}
                 />
@@ -218,6 +232,7 @@ export default function DisruptionPanel({
                 <span className="label">Panels</span>
                 <input
                   className="input" type="number" min={1} max={20}
+                  aria-label="Panel count"
                   value={panels}
                   onChange={(e) => setPanels(Number(e.target.value))}
                 />
@@ -226,6 +241,7 @@ export default function DisruptionPanel({
                 <span className="label">Minutes</span>
                 <select
                   className="select"
+                  aria-label="Interview minutes"
                   value={minutes}
                   onChange={(e) => setMinutes(Number(e.target.value))}
                 >
@@ -247,6 +263,7 @@ export default function DisruptionPanel({
             <span className="label">Student</span>
             <input
               className="input"
+              aria-label="Student ID"
               placeholder="S0272"
               value={studentId}
               onChange={(e) => setStudentId(e.target.value)}
@@ -259,6 +276,7 @@ export default function DisruptionPanel({
             <span className="label">Room</span>
             <select
               className="select"
+              aria-label="Room"
               value={roomId}
               onChange={(e) => setRoomId(e.target.value)}
             >
@@ -274,6 +292,7 @@ export default function DisruptionPanel({
             <span className="label">Day</span>
             <select
               className="select"
+              aria-label="Day"
               value={day}
               onChange={(e) => setDay(Number(e.target.value))}
             >
@@ -289,6 +308,7 @@ export default function DisruptionPanel({
             <span className="label">Hours late</span>
             <input
               className="input" type="number" min={0.25} step={0.25}
+              aria-label="Hours late"
               value={hours}
               onChange={(e) => setHours(Number(e.target.value))}
             />
@@ -302,6 +322,7 @@ export default function DisruptionPanel({
             </span>
             <select
               className="select"
+              aria-label={kind === "panel_drop" ? "Leaves at" : "Offer accepted at"}
               value={slot}
               onChange={(e) => setSlot(Number(e.target.value))}
             >
@@ -317,25 +338,33 @@ export default function DisruptionPanel({
         )}
 
         <button className="btn" style={{ width: "100%" }} onClick={add}>
+          <Icon name="plus" size={14} />
           {isRoster ? "Add this change" : "Add this event"}
         </button>
       </div>
 
       <div className="rail-section">
-        <span className="label">2 · Queued ({queue.length})</span>
+        <div className={`step-head${queue.length ? " on" : ""}`}>
+          <span className="step-n">2</span>
+          <span className="step-t">Queued</span>
+          <span className="count">{queue.length}</span>
+        </div>
         {queue.length === 0 ? (
-          <p className="hint">
-            Nothing added yet. If several things happened at once, add them all
-            before replanning — fixing them together moves far fewer interviews
-            than fixing them one at a time.
-          </p>
+          <div className="empty">
+            <Icon name="layers" size={17} />
+            <p className="hint">
+              Nothing added yet. If several things happened at once, add them
+              all before replanning — fixing them together moves far fewer
+              interviews than fixing them one at a time.
+            </p>
+          </div>
         ) : (
           <div className="queue">
             {queue.map((e, i) => (
               <div className="queue-item" key={i}>
                 <span style={{ flex: 1 }}>{describe(e)}</span>
-                <button className="x" onClick={() => onDrop(i)} aria-label="Remove">
-                  ×
+                <button className="x" onClick={() => onDrop(i)} aria-label="Remove from queue">
+                  <Icon name="close" size={13} />
                 </button>
               </div>
             ))}

@@ -1,10 +1,9 @@
-"""
-Panelist — scheduler CLI.
+"""Scheduler CLI.
 
     python -m scheduler.run --data ./data/primary --time-limit 30
 
-Solves an initial schedule, verifies it independently, prints metrics and
-(when interviews go unscheduled) the attributed infeasibility diagnostics.
+Solves an initial schedule, verifies it independently, prints metrics and,
+when interviews go unscheduled, the attributed infeasibility diagnostics.
 """
 
 import argparse

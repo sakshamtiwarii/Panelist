@@ -1,5 +1,4 @@
-"""
-Panelist — replan scenario regression.
+"""Replan scenario regression.
 
     python -m tests.test_replan_scenarios
 
@@ -11,8 +10,8 @@ hold no matter what the solver decides:
   - the schedule passes the model's own hard-constraint verification
   - locked interviews (already under way) are neither moved nor cancelled
 
-The lock assertion is the one that keeps catching real bugs: a replan that
-quietly rewrites the morning looks fine in every headline metric.
+The lock assertion matters most: a replan that quietly rewrites the morning
+looks fine in every headline metric.
 """
 
 import json

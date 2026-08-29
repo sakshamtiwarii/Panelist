@@ -1,14 +1,11 @@
--- Panelist — schedule state.
+-- Schedule state.
 --
--- The dataset tables exist so "who is affected" is a query rather than a scan
--- of a JSON blob: a coordinator asking "which students does this company's
--- delay touch, and what else do they have that day" is a join, and answering
--- it in Python means loading the whole week into memory first.
+-- The dataset tables exist so "who is affected" is a join rather than a scan
+-- of a JSON blob loaded into Python.
 --
--- Schedules are VERSIONED rather than mutated. A replan writes a new version
+-- Schedules are versioned rather than mutated: a replan writes a new version
 -- and flips `is_current`, so the schedule that existed before a disruption is
--- still there to diff against and to roll back to. Mutating in place would
--- destroy exactly the prior state the replanner needs.
+-- still there to diff against and roll back to.
 
 CREATE TABLE IF NOT EXISTS datasets (
     name        TEXT PRIMARY KEY,
@@ -31,9 +28,9 @@ CREATE TABLE IF NOT EXISTS companies (
     PRIMARY KEY (dataset, id)
 );
 
--- Disruption state that must outlive the replan that caused it: a company
--- that arrived late really was unavailable, and a panel that walked out is
--- still gone. Without these a second replan would silently forget the first.
+-- Disruption state that must outlive the replan that caused it: a company that
+-- arrived late really was unavailable, and a panel that walked out is still
+-- gone. Without these a second replan forgets the first.
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS
     unavailable_windows JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS
@@ -47,15 +44,13 @@ CREATE TABLE IF NOT EXISTS students (
     PRIMARY KEY (dataset, id)
 );
 
--- The shortlist relation is a real table rather than an array column so the
--- membership can be amended one pair at a time — which is what a mid-week
--- roster change actually is — and so the foreign keys below can cascade a
--- withdrawn company's entries away.
+-- A real table rather than an array column, so membership can be amended one
+-- pair at a time and the foreign keys can cascade a withdrawn company's
+-- entries away.
 --
--- No secondary index: every query against this table reads a whole dataset's
--- rows (`WHERE dataset = %s`), which the primary key's leading column already
--- serves. A (dataset, student_id) index was here for a per-student contention
--- query that is computed in Python, and cost a write on every shortlist row.
+-- No secondary index: every query here reads a whole dataset's rows
+-- (`WHERE dataset = %s`), which the primary key's leading column already
+-- serves.
 CREATE TABLE IF NOT EXISTS shortlists (
     dataset    TEXT NOT NULL,
     company_id TEXT NOT NULL,
@@ -64,8 +59,8 @@ CREATE TABLE IF NOT EXISTS shortlists (
     FOREIGN KEY (dataset, company_id) REFERENCES companies(dataset, id) ON DELETE CASCADE,
     FOREIGN KEY (dataset, student_id) REFERENCES students(dataset, id)  ON DELETE CASCADE
 );
--- Removes it from databases created before it was dropped. This file is
--- re-run on every connect, and the statement is a no-op once it is gone.
+-- Drops the index from databases created before it was removed. This file is
+-- re-run on every connect, so the statement is a no-op once it is gone.
 DROP INDEX IF EXISTS shortlists_student_idx;
 
 CREATE TABLE IF NOT EXISTS rooms (
@@ -119,9 +114,8 @@ CREATE TABLE IF NOT EXISTS unscheduled (
     PRIMARY KEY (schedule_id, interview_id)
 );
 
--- Audit trail: every applied replan, what caused it, and what it cost. Lets
--- the coordinator answer "what have we already moved today, and why" — which
--- a schedule alone cannot say.
+-- Audit trail: every applied replan, what caused it, and what it cost — what a
+-- schedule alone cannot say.
 CREATE TABLE IF NOT EXISTS replan_events (
     id             SERIAL PRIMARY KEY,
     dataset        TEXT    NOT NULL,
@@ -140,10 +134,9 @@ CREATE TABLE IF NOT EXISTS replan_events (
 );
 CREATE INDEX IF NOT EXISTS replan_events_dataset_idx ON replan_events (dataset, applied_at DESC);
 
--- Accounts. Passwords are stored as scrypt hashes with a per-user salt --
--- never plaintext, never a bare digest. `role` gates mutation: a viewer can
--- read the board and inspect proposals but cannot apply one, which is the
--- distinction that matters here (a replan changes hundreds of people's days).
+-- Accounts. Passwords are scrypt hashes with a per-user salt. `role` gates
+-- mutation: a viewer can read the board and inspect proposals but not apply
+-- one.
 CREATE TABLE IF NOT EXISTS users (
     username      TEXT PRIMARY KEY,
     display_name  TEXT NOT NULL,
@@ -154,15 +147,12 @@ CREATE TABLE IF NOT EXISTS users (
     last_login    TIMESTAMPTZ
 );
 
--- Pending replan proposals. A proposal is computed but NOT applied: it holds
--- the schedule that *would* result, and only POST /replan/apply commits it.
+-- Pending replan proposals: the schedule that would result, which only
+-- POST /replan/apply commits.
 --
--- This lives in the database rather than a process dict because it is the one
--- piece of state that gates a schedule mutation. Held in memory, a proposal
--- issued by one worker is a 404 on the next, and every pending approval is
--- lost on restart -- while the schedule it was computed against survives.
--- `expires_at` bounds the window: a proposal is only valid against the
--- schedule it was built from, so a stale one must not be applicable.
+-- In the database rather than a process dict, since a proposal held in memory
+-- is a 404 on the next worker and lost on restart. `expires_at` bounds the
+-- window — a proposal is only valid against the schedule it was built from.
 CREATE TABLE IF NOT EXISTS proposals (
     id         TEXT PRIMARY KEY,
     dataset    TEXT        NOT NULL,
