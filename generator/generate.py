@@ -171,7 +171,9 @@ def generate_companies(rng, n, days):
             panels = rng.randint(3, 7)
             duration = rng.choice([30, 30, 45])
         else:
-            tier, day_bias = 3, rng.randint(1, days - 1)  # niche -> later days
+            # Niche companies land later in the week — but a one-day week has
+            # no "later", and randint(1, 0) is an error rather than a choice.
+            tier, day_bias = 3, rng.randint(min(1, days - 1), days - 1)
             raw_size = banded(18, 45)
             cutoff = rng.uniform(7.6, 9.0)
             panels = rng.randint(1, 3)
@@ -425,6 +427,17 @@ def build_dataset(seed=42, companies=35, students=800, rooms=20, days=4,
     endpoint to the process's working directory and reduce every failure to a
     truncated stderr string.
     """
+    # Validated here, in one place: every downstream step assumes a non-empty
+    # cohort, and without this the failure surfaces as an IndexError or a
+    # ZeroDivisionError from deep inside the density report — a 500 with a
+    # traceback where the real answer is "that instance has no companies".
+    for label, value in (("companies", companies), ("students", students),
+                         ("rooms", rooms), ("days", days)):
+        if value < 1:
+            raise ValueError(f"{label} must be at least 1, got {value}")
+    if load_factor is not None and load_factor <= 0:
+        raise ValueError(f"load_factor must be positive, got {load_factor}")
+
     rng = random.Random(seed)
 
     config = build_config(days)

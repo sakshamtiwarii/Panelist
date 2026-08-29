@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from api.auth import current_user, require_coordinator
 from api.deps import require_dataset, require_schedule, set_loaded, store
+from api.routes.schedule import check_overrides
 from api.schemas import ApplyRequest, ReplanRequest
 from replanner.replan import DisruptionError, apply_proposal, replan
 from scheduler.metrics import compute_metrics
@@ -28,19 +29,22 @@ router = APIRouter(tags=["replan"])
 PROPOSAL_TTL_MINUTES = 30
 
 
-def propose(events, churn_cap_pct, time_limit_seconds, now_slot=None):
+def propose(events, churn_cap_pct, time_limit_seconds, now_slot=None,
+            priority_overrides=None):
     """Build a proposal from any list of events. Mutates nothing.
 
     Shared with the roster router: adding a company and reacting to a burst
     pipe are the same operation once both are expressed as events.
     """
     ds, schedule = require_schedule()
+    overrides = check_overrides(priority_overrides or {}, ds["companies"])
     try:
         proposal = replan(
             ds, schedule, events,
             churn_cap_pct=churn_cap_pct,
             time_limit_seconds=time_limit_seconds,
             now_slot=now_slot,
+            priority_overrides=overrides,
         )
     except DisruptionError as e:
         raise HTTPException(400, str(e))
@@ -67,7 +71,33 @@ def propose(events, churn_cap_pct, time_limit_seconds, now_slot=None):
         "churn_irreducible": proposal.get("churn_irreducible", False),
         "authorization_prompt": proposal["authorization_prompt"],
         "verification_errors": proposal["verification_errors"],
+        # How many interviews this fix leaves unplaced — the other half of the
+        # trade-off against churn, and the number the alternative usually
+        # pays in exchange for moving less.
+        "unscheduled": len(proposal["unscheduled"]),
         "has_alternative": "alternative" in proposal,
+        "alternative": _summarise_alternative(proposal.get("alternative")),
+        "priority_overrides": overrides,
+    }
+
+
+def _summarise_alternative(alt):
+    """The lower-churn option, as much as the coordinator needs to choose.
+
+    The full alternative schedule stays server-side with the proposal, exactly
+    like the primary one — this is the summary the choice is made on.
+    """
+    if alt is None:
+        return None
+    return {
+        "label": alt["label"],
+        "elective_churn_count": alt["diff"]["elective_churn_count"],
+        "elective_churn_pct": alt["diff"]["elective_churn_pct"],
+        "forced_churn_count": alt["diff"]["forced_churn_count"],
+        "unscheduled": len(alt["unscheduled"]),
+        "solver": alt["solver"],
+        "notify_count": alt["notify"]["total_people_to_contact"],
+        "verification_errors": alt["verification_errors"],
     }
 
 
@@ -76,15 +106,40 @@ def propose_replan(req: ReplanRequest, _=Depends(current_user)):
     """Propose a fix. Never mutates the live schedule."""
     events = [d.model_dump(exclude_none=True) for d in req.disruptions]
     return propose(events, req.churn_cap_pct, req.time_limit_seconds,
-                   req.now_slot)
+                   req.now_slot, req.priority_overrides)
 
 
 @router.post("/replan/apply")
 def commit_replan(req: ApplyRequest, _=Depends(require_coordinator)):
-    """Commit a proposal the coordinator accepted."""
-    proposal = store.get_proposal(req.proposal_id)
-    if proposal is None:
+    """Commit a proposal the coordinator accepted.
+
+    When the first fix exceeded the churn cap the replanner also solved for a
+    lower-churn one, and `use_alternative` commits that instead. Both were
+    computed against the same schedule and the same events, so the choice
+    between them is the coordinator's alone: fewer interviews moved, usually
+    at the cost of a few more left unplaced.
+    """
+    stored = store.get_proposal(req.proposal_id)
+    if stored is None:
         raise HTTPException(404, "unknown or expired proposal_id")
+
+    proposal = stored
+    if req.use_alternative:
+        alternative = stored.get("alternative")
+        if alternative is None:
+            raise HTTPException(409, {
+                "error": "no_alternative",
+                "message": (
+                    "This proposal has no lower-churn alternative — either it "
+                    "stayed within the cap, or re-solving found no cheaper "
+                    "fix. Apply it as it stands, or reject it."
+                ),
+            })
+        proposal = alternative
+        # The audit trail records what CAUSED the replan, and the cause is the
+        # same either way; the alternative is built by the same function but
+        # never carries the events itself.
+        proposal["_events"] = stored.get("_events", [])
     try:
         schedule = apply_proposal(proposal)
     except ValueError as e:
@@ -121,6 +176,10 @@ def commit_replan(req: ApplyRequest, _=Depends(require_coordinator)):
         "version": version,
         "metrics": metrics,
         "notify": proposal["notify"],
+        # Which of the two was committed, so the response is unambiguous in a
+        # log as well as on screen.
+        "applied_alternative": bool(req.use_alternative),
+        "label": proposal.get("label", "proposal"),
     }
 
 

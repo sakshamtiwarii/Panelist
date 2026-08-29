@@ -46,6 +46,17 @@ class DisruptionError(ValueError):
     """Raised when a disruption event does not name a real entity."""
 
 
+def _stamp(config, absolute_slot):
+    """An absolute slot as 'Day 2 12:00'.
+
+    Event descriptions are read by a coordinator deciding whether to accept a
+    fix, and a raw slot index is not something anyone can check against a
+    clock on the wall.
+    """
+    day, slot = timegrid.split(config, absolute_slot)
+    return f"Day {day + 1} {timegrid.clock(config, slot)}"
+
+
 # --- disruption application ------------------------------------------------
 
 def apply_disruption(dataset, disruption, prior_schedule, now_slot=None):
@@ -108,14 +119,33 @@ def apply_disruption(dataset, disruption, prior_schedule, now_slot=None):
         # interviews it held at 10:00. Model the loss as a blackout consuming
         # capacity from that moment on, exactly as a blocked room does, rather
         # than lowering the count for the entire week.
-        for _ in range(count):
-            company.setdefault("panel_blackouts", []).append(
-                (from_slot, horizon)
+        #
+        # Clamped to the panels that are actually still running. Each blackout
+        # is a fixed interval against a Cumulative of capacity `panel_count`,
+        # so writing more of them than there are panels does not over-drop the
+        # company — it makes the whole model INFEASIBLE, and the coordinator
+        # gets "no valid schedule exists" for the perfectly ordinary act of
+        # standing a small company's interviewers down.
+        existing = company.setdefault("panel_blackouts", [])
+        already_out = sum(1 for _w0, w1 in existing if w1 > from_slot)
+        available = max(0, company["panel_count"] - already_out)
+        dropped = min(count, available)
+        for _ in range(dropped):
+            existing.append((from_slot, horizon))
+
+        when = _stamp(dataset["config"], from_slot)
+        if dropped < count:
+            had = (f"it had only {available} still running"
+                   if available else "all of its panels were already out")
+            return (
+                f"{company['name']} was asked to stand down {count} panel(s) "
+                f"from {when}, but {had} — it interviews no one for the rest "
+                f"of the week.",
+                [],
             )
         return (
-            f"{company['name']} loses {count} panel(s) from slot {from_slot} "
-            f"onward ({company['panel_count']} -> "
-            f"{company['panel_count'] - count} for the rest of the week).",
+            f"{company['name']} loses {dropped} panel(s) from {when} onward "
+            f"({available} -> {available - dropped} for the rest of the week).",
             [],
         )
 
@@ -407,6 +437,7 @@ def replan(
     time_limit_seconds=30,
     now_slot=None,
     churn_penalty_weight=DEFAULT_CHURN_WEIGHT,
+    priority_overrides=None,
 ):
     """Resolve disruptions with minimal disturbance.
 
@@ -414,6 +445,11 @@ def replan(
 
     `now_slot` is the current moment: interviews that already started are
     locked, so a replan can never rewrite the past.
+
+    `priority_overrides` carries the coordinator's exceptions to the tier
+    default (guide section 4, question 2). They belong here rather than in the
+    dataset because they are a decision about THIS fix — which company must
+    survive this particular squeeze — not a standing property of the company.
     """
     if isinstance(disruptions, dict):
         disruptions = [disruptions]
@@ -463,7 +499,7 @@ def replan(
     attempt, _last_report = _solve_attempt(
         working, prior_schedule, locked,
         churn_penalty_weight, time_limit_seconds,
-        with_report=True,
+        with_report=True, priority_overrides=priority_overrides,
     )
     if attempt is None:
         # Distinguish "proved impossible" from "ran out of time". Reporting a
@@ -497,6 +533,7 @@ def replan(
         looser = _solve_attempt(
             working, prior_schedule, locked,
             STABILITY_CHURN_WEIGHT, time_limit_seconds,
+            priority_overrides=priority_overrides,
         )
         if looser is not None:
             alt = _build_proposal(
@@ -558,19 +595,33 @@ def _validate_locks(working, prior_schedule, locked):
         company = companies.get(cid)
         if not company:
             continue
-        peak, peak_at = 0, None
+        panels = company["panel_count"]
+        blackouts = company.get("panel_blackouts", [])
+
+        # Capacity is checked at each already-run moment rather than against a
+        # single week-wide peak, because a blackout removes a panel from one
+        # part of the week only. A blackout laid over an hour the company has
+        # already interviewed in is just as contradictory as cutting its panel
+        # count, and used to reach the solver as a bare INFEASIBLE.
+        worst = None
         for probe in items:
+            at = probe["start"]
             concurrent = sum(
-                1 for other in items
-                if other["start"] <= probe["start"] < other["end"]
+                1 for other in items if other["start"] <= at < other["end"]
             )
-            if concurrent > peak:
-                peak, peak_at = concurrent, probe
-        if peak > company["panel_count"]:
+            out = sum(1 for w0, w1 in blackouts if w0 <= at < w1)
+            available = max(0, panels - out)
+            if concurrent > available:
+                shortfall = concurrent - available
+                if worst is None or shortfall > worst[0]:
+                    worst = (shortfall, concurrent, available, probe)
+        if worst:
+            _, concurrent, available, probe = worst
             conflicts.append(
-                f"{company['name']} already ran {peak} concurrent interviews "
-                f"on Day {peak_at['day'] + 1} slot {peak_at['slot']}, but the "
-                f"disruption leaves it {company['panel_count']} panel(s)."
+                f"{company['name']} already had {concurrent} interview(s) "
+                f"running at {_stamp(working['config'], probe['start'])}, but "
+                f"the disruption leaves it {available} panel(s) at that "
+                f"moment."
             )
 
         # Company made unavailable during an hour it has already interviewed.
@@ -580,20 +631,21 @@ def _validate_locks(working, prior_schedule, locked):
                 conflicts.append(
                     f"{company['name']} is marked unavailable over a window "
                     f"in which {len(clashing)} of its interviews have already "
-                    f"taken place (e.g. Day {clashing[0]['day'] + 1} "
-                    f"slot {clashing[0]['slot']})."
+                    f"taken place (e.g. "
+                    f"{_stamp(working['config'], clashing[0]['start'])})."
                 )
     return conflicts
 
 
 def _solve_attempt(working, prior_schedule, locked, churn_weight, time_limit,
-                   with_report=False):
+                   with_report=False, priority_overrides=None):
     model = SchedulingModel(
         working["companies"], working["students"], working["rooms"],
         working["config"],
         prior_schedule=prior_schedule,
         churn_penalty_weight=churn_weight,
         locked=locked,
+        priority_overrides=priority_overrides,
     ).build()
     model.add_warm_start()
     status, solver = model.solve(time_limit_seconds=time_limit)

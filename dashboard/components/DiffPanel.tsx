@@ -21,7 +21,7 @@ interface Props {
   clock: Clock;
   companyName: (id: string) => string;
   applying: boolean;
-  onApply: () => void;
+  onApply: (useAlternative?: boolean) => void;
   onReject: () => void;
   onHoverStudent: (sid: string | null) => void;
 }
@@ -59,6 +59,10 @@ export default function DiffPanel({
   const cap = proposal.churn_cap_pct ?? 10;
   const pct = d.elective_churn_pct;
   const over = !!proposal.cap_exceeded;
+  // Only offered when re-solving actually found a meaningfully cheaper fix;
+  // when the churn is irreducible the replanner says so instead.
+  const alt = proposal.alternative ?? null;
+  const unplaced = proposal.unscheduled ?? 0;
   // Scale so the cap marker sits at a readable position even for tiny churn.
   const scaleMax = Math.max(cap * 1.6, pct * 1.15, 1);
 
@@ -133,6 +137,36 @@ export default function DiffPanel({
 
         {proposal.authorization_prompt && (
           <div className="callout">{proposal.authorization_prompt}</div>
+        )}
+
+        {alt && (
+          <div className="callout" style={{ marginTop: 10 }}>
+            <strong>A lower-churn fix exists.</strong>
+            <div className="alt-compare">
+              <div>
+                <span className="label">This fix</span>
+                <div className="alt-n num">{d.elective_churn_count} moved</div>
+                <div className="alt-sub">{unplaced} left unplaced</div>
+              </div>
+              <div>
+                <span className="label">Alternative</span>
+                <div className="alt-n num">{alt.elective_churn_count} moved</div>
+                <div className="alt-sub">{alt.unscheduled} left unplaced</div>
+              </div>
+            </div>
+            <p className="hint" style={{ margin: "8px 0 0" }}>
+              {alt.unscheduled > unplaced ? (
+                <>
+                  Moving {d.elective_churn_count - alt.elective_churn_count}{" "}
+                  fewer interviews costs {alt.unscheduled - unplaced} more left
+                  unplaced. Which matters more is your call, not the
+                  solver&rsquo;s.
+                </>
+              ) : (
+                "It moves fewer interviews and leaves no more unplaced."
+              )}
+            </p>
+          </div>
         )}
         {!canApply && (
           <div className="callout">
@@ -235,7 +269,7 @@ export default function DiffPanel({
       <div className="diff-actions">
         <button
           className="btn btn-primary"
-          onClick={onApply}
+          onClick={() => onApply(false)}
           disabled={applying || !canApply
                     || !!proposal.verification_errors?.length}
           title={!canApply
@@ -244,6 +278,17 @@ export default function DiffPanel({
         >
           {applying ? "Applying…" : over ? "Apply anyway" : "Apply this fix"}
         </button>
+        {alt && (
+          <button
+            className="btn"
+            onClick={() => onApply(true)}
+            disabled={applying || !canApply
+                      || !!alt.verification_errors?.length}
+            title="Commit the lower-churn schedule instead"
+          >
+            Apply the {alt.elective_churn_count}-move fix
+          </button>
+        )}
         <button className="btn btn-danger" onClick={onReject} disabled={applying}>
           Discard
         </button>

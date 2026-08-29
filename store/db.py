@@ -21,6 +21,7 @@ import os
 import pathlib
 import threading
 import time
+from collections import defaultdict
 
 SCHEMA_PATH = pathlib.Path(__file__).with_name("schema.sql")
 
@@ -192,23 +193,32 @@ class MemoryStore:
             and (room is None or a.get("room") == room)
             and (day is None or a["day"] == day)
         ]
-        sids = {a["student_id"] for a in hit}
         ds = self._datasets.get(dataset, {})
         cgpa = {s["id"]: s["cgpa"] for s in ds.get("students", [])}
+
+        by_student = defaultdict(list)
+        for a in hit:
+            by_student[a["student_id"]].append(a)
+
         out = []
-        for sid in sorted(sids):
-            same_day = [
-                a for a in rows
-                if a["student_id"] == sid
-                and (day is None or a["day"] == day)
-            ]
+        for sid, mine in by_student.items():
+            # "That day" means the days this student was actually hit on, not
+            # the whole week. With no day filter the old code counted every
+            # interview they had all week, which answers a different question
+            # than the column name — and a different one than the SQL store.
+            hit_days = {a["day"] for a in mine}
+            same_day = sum(
+                1 for a in rows
+                if a["student_id"] == sid and a["day"] in hit_days
+            )
             out.append({
                 "student_id": sid,
                 "cgpa": cgpa.get(sid),
-                "interviews_hit": sum(1 for a in hit if a["student_id"] == sid),
-                "other_interviews_that_day": len(same_day)
-                - sum(1 for a in hit if a["student_id"] == sid),
+                "interviews_hit": len(mine),
+                "other_interviews_that_day": same_day - len(mine),
             })
+        # Same order as PostgresStore: worst-hit first, ties by id.
+        out.sort(key=lambda r: (-r["interviews_hit"], r["student_id"]))
         return out
 
 
@@ -630,19 +640,29 @@ class PostgresStore:
                 JOIN schedules s ON s.id = a.schedule_id
                 WHERE {' AND '.join(clauses)}
                 GROUP BY a.schedule_id, a.student_id, a.day
+            ),
+            -- Per (student, day) hit: what ELSE that student has that same
+            -- day. Kept as its own step so the correlated count stays scoped
+            -- to the day, while the final grouping is per student.
+            per_day AS (
+                SELECT h.student_id, h.n,
+                       (SELECT COUNT(*) FROM appointments o
+                         WHERE o.schedule_id = h.schedule_id
+                           AND o.student_id  = h.student_id
+                           AND o.day         = h.day) - h.n AS others
+                FROM hit h
             )
-            SELECT h.student_id,
+            -- One row per student. Grouping by h.day as well used to emit a
+            -- row per student-day, so an unfiltered query reported more
+            -- students affected than there were students.
+            SELECT p.student_id,
                    st.cgpa,
-                   SUM(h.n)::int AS interviews_hit,
-                   (SELECT COUNT(*) FROM appointments o
-                     WHERE o.schedule_id = h.schedule_id
-                       AND o.student_id = h.student_id
-                       AND o.day = h.day)::int - SUM(h.n)::int
-                       AS other_interviews_that_day
-            FROM hit h
-            JOIN students st ON st.dataset = %s AND st.id = h.student_id
-            GROUP BY h.student_id, st.cgpa, h.schedule_id, h.day
-            ORDER BY interviews_hit DESC, h.student_id
+                   SUM(p.n)::int      AS interviews_hit,
+                   SUM(p.others)::int AS other_interviews_that_day
+            FROM per_day p
+            JOIN students st ON st.dataset = %s AND st.id = p.student_id
+            GROUP BY p.student_id, st.cgpa
+            ORDER BY interviews_hit DESC, p.student_id
         """
         with self._tx() as cur:
             cur.execute(sql, params + [dataset])

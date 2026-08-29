@@ -58,21 +58,32 @@ export const api = {
   me: () => call<Session>("/auth/me"),
   config: () => call<ConfigResponse>("/config"),
   health: () => call<Health>("/health"),
-  solve: (dataset: string, timeLimit: number) =>
+  generate: (body: GenerateBody) =>
+    call<GenerateResponse>("/generate", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  solve: (dataset: string, timeLimit: number,
+          priorityOverrides: PriorityOverrides = {}) =>
     call<SolveResponse>("/schedule", {
       method: "POST",
-      body: JSON.stringify({ dataset, time_limit_seconds: timeLimit }),
+      body: JSON.stringify({
+        dataset, time_limit_seconds: timeLimit,
+        priority_overrides: priorityOverrides,
+      }),
     }),
   schedule: () => call<{ count: number; appointments: Appointment[] }>("/schedule"),
   metrics: () => call<Metrics>("/metrics"),
   diagnostics: () => call<Diagnostics>("/diagnostics"),
   propose: (body: ReplanBody) =>
     call<Proposal>("/replan", { method: "POST", body: JSON.stringify(body) }),
-  apply: (proposalId: string) =>
-    call<{ applied: boolean; appointments: number; churn: number }>(
-      "/replan/apply",
-      { method: "POST", body: JSON.stringify({ proposal_id: proposalId }) },
-    ),
+  apply: (proposalId: string, useAlternative = false) =>
+    call<ApplyResponse>("/replan/apply", {
+      method: "POST",
+      body: JSON.stringify({
+        proposal_id: proposalId, use_alternative: useAlternative,
+      }),
+    }),
 };
 
 /* ---- types ------------------------------------------------------------- */
@@ -87,6 +98,24 @@ export interface Health {
   status: string;
   dataset_loaded: string | null;
   has_schedule: boolean;
+}
+
+export interface GenerateBody {
+  name: string;
+  seed: number;
+  companies: number;
+  students: number;
+  rooms: number;
+  days: number;
+  /** Omit for the natural (oversubscribed) instance; 0.9 is hard but solvable. */
+  load_factor?: number;
+}
+
+export interface GenerateResponse {
+  dataset: string;
+  seed: number;
+  path: string;
+  density_report: string;
 }
 
 export interface GridConfig {
@@ -207,11 +236,40 @@ export interface DisruptionEvent {
   shortlist_size?: number;
 }
 
+/**
+ * The coordinator's exceptions to the solver's tier priority, company_id ->
+ * level. "normal" is the same as saying nothing; the API strips it.
+ */
+export type PriorityLevel = "protect" | "normal" | "deprioritise";
+export type PriorityOverrides = Record<string, PriorityLevel>;
+
 export interface ReplanBody {
   disruptions: DisruptionEvent[];
   churn_cap_pct: number;
   time_limit_seconds: number;
   now_slot?: number | null;
+  priority_overrides?: PriorityOverrides;
+}
+
+export interface ApplyResponse {
+  applied: boolean;
+  appointments: number;
+  churn: number;
+  version: number;
+  applied_alternative: boolean;
+  label: string;
+}
+
+/** The lower-churn option, summarised enough to choose between the two. */
+export interface AlternativeSummary {
+  label: string;
+  elective_churn_count: number;
+  elective_churn_pct: number;
+  forced_churn_count: number;
+  unscheduled: number;
+  solver: SolverReport;
+  notify_count: number;
+  verification_errors: string[];
 }
 
 export interface ChangeDetail {
@@ -259,5 +317,8 @@ export interface Proposal {
   churn_irreducible?: boolean;
   authorization_prompt?: string | null;
   verification_errors?: string[];
+  unscheduled?: number;
   has_alternative?: boolean;
+  alternative?: AlternativeSummary | null;
+  priority_overrides?: PriorityOverrides;
 }

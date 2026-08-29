@@ -174,6 +174,154 @@ def test_apply_commits_a_new_version(coordinator, solved):
                             json={"proposal_id": pid}).status_code == 404
 
 
+def test_bad_generator_settings_are_a_400_not_a_500(coordinator):
+    """A wrong number in the request body is the caller's fault, not a fault.
+
+    Returning 500 sends whoever sent it looking for a broken server.
+    """
+    r = coordinator.post("/generate", json={
+        "name": "bad", "seed": 1, "companies": 0, "students": 40,
+        "rooms": 2, "days": 4,
+    })
+    assert r.status_code == 400
+    assert "companies must be at least 1" in r.json()["detail"]
+
+
+def test_structured_error_bodies_stay_renderable(coordinator, solved):
+    """The console reduces an error body to one line; pin what it reads.
+
+    The dashboard has no test runner, so this is where the contract lives.
+    `describeError` looks for `detail.message` on the stale-dataset 409 and
+    `detail.solver.note` on the unsolvable-week 422 — an error body that stops
+    carrying those degrades the console to a bare "API error 4xx", and the
+    version that returned the object instead crashed it outright.
+    """
+    import json as _json
+
+    # A plain string detail is the common case and must stay a string.
+    r = coordinator.post("/generate", json={
+        "name": "bad", "seed": 1, "companies": 0, "students": 40,
+        "rooms": 2, "days": 4,
+    })
+    assert isinstance(r.json()["detail"], str)
+
+    # Request-validation failures arrive as a list of objects carrying "msg".
+    r = coordinator.post("/schedule", json={"time_limit_seconds": "soon"})
+    assert r.status_code == 422
+    body = r.json()["detail"]
+    assert isinstance(body, list) and "msg" in body[0]
+
+    # Whatever the shape, it must survive a round trip as JSON — the console
+    # parses the body before it reads any field off it.
+    assert _json.loads(_json.dumps(body)) == body
+
+
+def test_applying_a_missing_alternative_is_refused_clearly(coordinator, solved):
+    """The looser fix is real, so asking for one that does not exist must say so.
+
+    `replan` only offers an alternative when re-solving found a meaningfully
+    cheaper one; when the churn is irreducible there is nothing to take, and
+    silently committing the primary schedule instead would apply a plan the
+    coordinator did not choose.
+    """
+    proposed = coordinator.post("/replan", json={
+        "disruptions": [{"type": "company_late", "company_id": "C001",
+                         "day": 2, "hours": 2}],
+        "time_limit_seconds": 15,
+    }).json()
+    if not proposed["ok"]:
+        pytest.skip("disruption infeasible on this dataset")
+    if proposed["has_alternative"]:
+        pytest.skip("this proposal does have an alternative")
+
+    r = coordinator.post("/replan/apply", json={
+        "proposal_id": proposed["proposal_id"], "use_alternative": True,
+    })
+    assert r.status_code == 409
+    assert r.json()["detail"]["error"] == "no_alternative"
+
+
+def test_a_proposal_reports_what_it_leaves_unplaced(coordinator, solved):
+    """Churn is only half the trade-off; the other half is coverage."""
+    proposed = coordinator.post("/replan", json={
+        "disruptions": [{"type": "company_late", "company_id": "C001",
+                         "day": 2, "hours": 2}],
+        "time_limit_seconds": 15,
+    }).json()
+    if not proposed["ok"]:
+        pytest.skip("disruption infeasible on this dataset")
+    assert isinstance(proposed["unscheduled"], int)
+    # And when an alternative is offered, both sides of the choice are costed.
+    if proposed["has_alternative"]:
+        alt = proposed["alternative"]
+        assert {"elective_churn_count", "unscheduled"} <= set(alt)
+        assert alt["elective_churn_count"] < proposed["diff"]["elective_churn_count"]
+
+
+def test_priority_overrides_reach_the_solver_and_are_echoed(coordinator, solved):
+    """The coordinator's exception must be visible in what came back."""
+    cfg = coordinator.get("/config").json()
+    niche = next((c["id"] for c in cfg["companies"] if c["tier"] == 3),
+                 cfg["companies"][0]["id"])
+    r = coordinator.post("/schedule", json={
+        "dataset": DATASET, "time_limit_seconds": 15,
+        "priority_overrides": {niche: "protect"},
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["priority_overrides"] == {niche: "protect"}
+    assert "protected" in body["priority_reasons"][niche]
+
+
+def test_an_override_naming_an_unknown_company_is_refused(coordinator, solved):
+    """Ignoring it would leave the coordinator believing they had acted."""
+    r = coordinator.post("/schedule", json={
+        "dataset": DATASET, "time_limit_seconds": 10,
+        "priority_overrides": {"C999": "protect"},
+    })
+    assert r.status_code == 400
+    assert r.json()["detail"]["error"] == "unknown_company_in_priority_overrides"
+
+
+def test_an_unknown_priority_level_is_refused(coordinator, solved):
+    r = coordinator.post("/schedule", json={
+        "dataset": DATASET, "time_limit_seconds": 10,
+        "priority_overrides": {"C001": "vip"},
+    })
+    assert r.status_code == 422
+
+
+def test_metrics_and_diagnostics_agree_on_the_shortfall(coordinator, solved):
+    """The two endpoints the console shows side by side must not contradict.
+
+    They are computed by different paths — /metrics from the stored schedule,
+    /diagnostics by rebuilding the interview list — so they can disagree, and
+    they did: after a replan that grounded a company for the whole week the
+    band read "Unplaced 0 · none" beside a rail reading "Can't be placed (38)".
+    """
+    cfg = coordinator.get("/config").json()
+    days, hours_per_day = cfg["config"]["days"], 8
+    company = cfg["companies"][0]["id"]
+
+    proposed = coordinator.post("/replan", json={
+        "disruptions": [{"type": "company_late", "company_id": company,
+                         "day": 0, "hours": days * hours_per_day}],
+        "time_limit_seconds": 15,
+    }).json()
+    if not proposed["ok"]:
+        pytest.skip(f"disruption infeasible on this dataset: {proposed['reason']}")
+    applied = coordinator.post("/replan/apply",
+                               json={"proposal_id": proposed["proposal_id"]})
+    assert applied.status_code == 200, applied.text
+
+    metrics = coordinator.get("/metrics").json()
+    diagnostics = coordinator.get("/diagnostics").json()
+    assert metrics["interviews_unscheduled"] == diagnostics["unscheduled"]
+    # And the shortfall is real: grounding a company cannot leave 100% placed.
+    if diagnostics["unscheduled"]:
+        assert metrics["pct_scheduled"] < 100.0
+
+
 def test_replan_history_records_the_applied_fix(coordinator, solved):
     events = coordinator.get("/replan/history").json()["events"]
     assert isinstance(events, list)

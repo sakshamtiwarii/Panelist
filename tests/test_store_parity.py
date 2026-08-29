@@ -149,6 +149,56 @@ def test_affected_counts_other_interviews_that_day(store, dataset_name, sample):
         assert r["other_interviews_that_day"] == len(same_day) - r["interviews_hit"]
 
 
+def test_affected_is_one_row_per_student_across_days(store, dataset_name):
+    """With no day filter, a student hit on several days is still ONE student.
+
+    The other tests all pass an explicit day, which hides this: Postgres
+    grouped by day as well as student and returned a row per student-day, so
+    GET /affected reported more students affected than the cohort contained,
+    while MemoryStore returned one row whose "that day" count was really the
+    student's whole week. Two stores, two different wrong answers.
+    """
+    from generator.generate import build_dataset
+    ds, _ = build_dataset(seed=42, companies=6, students=40, rooms=3, days=4)
+    company = ds["companies"][0]["id"]
+    other = ds["companies"][1]["id"]
+    sid = ds["students"][0]["id"]
+
+    # From the dataset's own config, never a hardcoded 32 — the same rule the
+    # rest of the codebase follows (see scheduler/timegrid.py).
+    raw = ds["config"]["slots_per_day_raw"]
+
+    def appt(n, cid, day, slot):
+        start = day * raw + slot
+        return {"id": f"{cid}~{sid}#{n}", "company_id": cid, "student_id": sid,
+                "day": day, "slot": slot, "start": start, "end": start + 2,
+                "duration_slots": 2, "tier": 1, "room": "R00", "panel": 0}
+
+    # Hit on days 0 and 2, with one other interview on each of those days —
+    # and one on day 3, which is not a hit day and must not be counted.
+    schedule = [appt(1, company, 0, 0), appt(2, other, 0, 4),
+                appt(3, company, 2, 0), appt(4, other, 2, 4),
+                appt(5, other, 3, 8)]
+    store.put_dataset(dataset_name, ds)
+    store.put_schedule(dataset_name, schedule, [], {"status": "OPTIMAL"}, {})
+
+    rows = store.affected(dataset_name, company_id=company)
+    assert len(rows) == 1, "one row per student, not per student-day"
+    assert rows[0]["interviews_hit"] == 2
+    # Both hit days contribute their own companions; day 3 does not.
+    assert rows[0]["other_interviews_that_day"] == 2
+
+
+def test_affected_orders_worst_hit_first(store, dataset_name, sample):
+    """Order is part of the contract: the route truncates to rows[:200]."""
+    ds, sched = sample
+    store.put_dataset(dataset_name, ds)
+    store.put_schedule(dataset_name, sched, [], {"status": "OPTIMAL"}, {})
+    rows = store.affected(dataset_name)
+    keys = [(-r["interviews_hit"], r["student_id"]) for r in rows]
+    assert keys == sorted(keys)
+
+
 def test_concurrent_reads_do_not_collide(store, dataset_name, sample):
     """Several threads hitting the store at once must all succeed.
 

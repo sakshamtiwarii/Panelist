@@ -439,6 +439,18 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
   color: var(--st-cut);
 }
 
+/* The two fixes side by side. Churn and coverage are shown together because
+   the choice between them is a trade, and a single number hides that. */
+.alt-compare {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px;
+}
+.alt-compare > div {
+  border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
+  border-radius: var(--r-sm); padding: 7px 9px;
+}
+.alt-n { font-size: 15px; line-height: 1.2; margin-top: 3px; }
+.alt-sub { font-size: 11px; opacity: 0.8; margin-top: 2px; }
+
 .diff-group { border-bottom: 1px solid var(--line); }
 .diff-group-head {
   display: flex; align-items: center; gap: 9px; width: 100%;

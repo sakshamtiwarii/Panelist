@@ -4,8 +4,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   API_BASE, ApiError, api, diagnoseReachability,
   type Appointment, type ConfigResponse, type Diagnostics,
-  type DisruptionEvent, type Metrics, type Proposal, type Session,
-  type SolverReport,
+  type DisruptionEvent, type Metrics, type PriorityLevel,
+  type PriorityOverrides, type Proposal, type Session, type SolverReport,
 } from "@/lib/api";
 import { makeClock } from "@/lib/time";
 import DiffPanel from "@/components/DiffPanel";
@@ -44,11 +44,18 @@ export default function Page() {
   const [error, setError] = useState<string | null>(null);
   const [nowSlot, setNowSlot] = useState<number | null>(null);
   const [churnCap, setChurnCap] = useState(10);
+  // The coordinator's exceptions to the solver's tier priority. Held with the
+  // request rather than on the company, because "protect this one through
+  // THIS squeeze" is a decision about a solve, not a standing property.
+  const [priority, setPriority] = useState<PriorityOverrides>({});
   const [focusStudent, setFocusStudent] = useState<string | null>(null);
   const [theme, setTheme] = useState<"system" | "light" | "dark">("system");
   // "origin-rejected" means the API answered but refused this page's origin —
   // almost always the wrong port, which otherwise looks like a dead backend.
   const [reach, setReach] = useState<"unreachable" | "origin-rejected" | null>(null);
+  // The API is up and answering, but no dataset has been generated yet. A
+  // fresh clone always lands here, because data/ is gitignored.
+  const [needsDataset, setNeedsDataset] = useState(false);
 
   // Explicit choice stamps the root; "system" removes the stamp and lets
   // prefers-color-scheme decide.
@@ -100,19 +107,27 @@ export default function Page() {
     })();
   }, []);
 
+  const load = useCallback(async () => {
+    try {
+      setCfg(await api.config());
+      setNeedsDataset(false);
+      setError(null);
+      const h = await api.health();
+      if (h.has_schedule) await refresh();
+    } catch (e) {
+      setError(describeError(e));
+      // A 404 from /config means one specific thing: the API is healthy and
+      // there is simply no dataset on disk yet. Reporting that as "nothing is
+      // answering" sends the coordinator to restart a container that is fine.
+      if (e instanceof ApiError && e.status === 404) setNeedsDataset(true);
+      else if (isNetworkFailure(e)) setReach(await diagnoseReachability());
+    }
+  }, [refresh]);
+
   useEffect(() => {
     if (!session) return;
-    (async () => {
-      try {
-        setCfg(await api.config());
-        const h = await api.health();
-        if (h.has_schedule) await refresh();
-      } catch (e) {
-        setError(describeError(e));
-        if (isNetworkFailure(e)) setReach(await diagnoseReachability());
-      }
-    })();
-  }, [session, refresh]);
+    void load();
+  }, [session, load]);
 
   const signOut = async () => {
     try { await api.logout(); } catch { /* cookie may already be gone */ }
@@ -124,11 +139,30 @@ export default function Page() {
     setQueue([]);
   };
 
+  // A fresh clone has no data/ — it is gitignored, and generating it was a
+  // curl the console gave no way to make. These are the settings the README
+  // and CI both treat as the primary dataset.
+  const generateStarter = async () => {
+    setBusy("Generating");
+    setError(null);
+    try {
+      await api.generate({
+        name: "primary", seed: 42, companies: 35, students: 800,
+        rooms: 20, days: 4, load_factor: 0.9,
+      });
+      await load();
+    } catch (e) {
+      setError(describeError(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const solve = async () => {
     setBusy("Solving");
     setError(null);
     try {
-      const r = await api.solve("primary", 30);
+      const r = await api.solve("primary", 30, priority);
       setSolver(r.solver);
       setProposal(null);
       setQueue([]);
@@ -152,6 +186,7 @@ export default function Page() {
         churn_cap_pct: churnCap,
         time_limit_seconds: 60,
         now_slot: nowSlot,
+        priority_overrides: priority,
       }));
     } catch (e) {
       setError(describeError(e));
@@ -160,11 +195,11 @@ export default function Page() {
     }
   };
 
-  const applyProposal = async () => {
+  const applyProposal = async (useAlternative = false) => {
     if (!proposal?.proposal_id) return;
     setBusy("Applying");
     try {
-      await api.apply(proposal.proposal_id);
+      await api.apply(proposal.proposal_id, useAlternative);
       setProposal(null);
       setQueue([]);
       await refresh();
@@ -254,7 +289,48 @@ export default function Page() {
     return (
       <div className="bare">
         <div className="bare-card">
-          {reach === "origin-rejected" ? (
+          {needsDataset ? (
+            <>
+              <h2>No dataset yet</h2>
+              <p className="hint">
+                The scheduler is running and answering — there is just nothing
+                for it to schedule. A fresh clone ships without one, because
+                generated datasets are not kept in the repository.
+              </p>
+              {session.role === "coordinator" ? (
+                <>
+                  <p className="hint" style={{ marginTop: 10 }}>
+                    Build the standard week: 35 companies, 800 students, 20
+                    rooms over 4 days, at a load the solver can fully place.
+                  </p>
+                  <button
+                    className="btn btn-primary btn-lg"
+                    style={{ marginTop: 12 }}
+                    onClick={generateStarter}
+                    disabled={!!busy}
+                  >
+                    {busy === "Generating"
+                      ? "Generating…"
+                      : "Generate the starter dataset"}
+                  </button>
+                  <p className="hint" style={{ marginTop: 10, marginBottom: 0 }}>
+                    Or run it yourself — the same settings this button uses:{" "}
+                    <code>
+                      python -m generator.generate --seed 42 --companies 35
+                      --students 800 --rooms 20 --days 4 --load-factor 0.9
+                      --out ./data/primary
+                    </code>
+                  </p>
+                </>
+              ) : (
+                <p className="hint" style={{ marginTop: 10 }}>
+                  Generating one changes what everybody sees, so it needs a
+                  coordinator account. Ask a coordinator to press{" "}
+                  <strong>Generate the starter dataset</strong>, then reload.
+                </p>
+              )}
+            </>
+          ) : reach === "origin-rejected" ? (
             <>
               <h2>Wrong address for this console</h2>
               <p className="hint">
@@ -460,6 +536,74 @@ export default function Page() {
             </p>
           </div>
 
+          <div className="rail-section">
+            <span className="label" style={{ display: "block", marginBottom: 6 }}>
+              Priority overrides
+            </span>
+            <p className="hint" style={{ marginTop: 0, marginBottom: 10 }}>
+              When there isn&rsquo;t room for everyone the solver drops niche
+              companies before mass recruiters. Override that here — it applies
+              to the next build and the next replan.
+            </p>
+            <div className="field">
+              <select
+                className="select"
+                value=""
+                onChange={(e) => {
+                  const id = e.target.value;
+                  if (id) setPriority((p) => ({ ...p, [id]: "protect" }));
+                }}
+              >
+                <option value="">Add a company…</option>
+                {cfg.companies
+                  .filter((c) => !priority[c.id])
+                  .map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name} · tier {c.tier}
+                    </option>
+                  ))}
+              </select>
+            </div>
+            {Object.keys(priority).length === 0 ? (
+              <p className="hint" style={{ marginBottom: 0 }}>
+                None set — the solver&rsquo;s own tier order applies.
+              </p>
+            ) : (
+              <div className="queue">
+                {Object.entries(priority).map(([id, level]) => (
+                  <div className="queue-item" key={id}>
+                    <span style={{ flex: 1 }}>{companyName(id)}</span>
+                    <div className="seg" role="group" aria-label="Priority">
+                      {(["protect", "deprioritise"] as const).map((lv) => (
+                        <button
+                          key={lv}
+                          aria-pressed={level === lv}
+                          title={lv === "protect"
+                            ? "Keep this company's interviews ahead of the tier order"
+                            : "Drop this company first when capacity is short"}
+                          onClick={() =>
+                            setPriority((p) => ({ ...p, [id]: lv as PriorityLevel }))
+                          }
+                        >
+                          {lv === "protect" ? "Protect" : "Drop first"}
+                        </button>
+                      ))}
+                    </div>
+                    <button
+                      className="x"
+                      aria-label="Remove override"
+                      onClick={() =>
+                        setPriority(({ [id]: _drop, ...rest }) => rest)
+                      }
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
           {diag && diag.unscheduled > 0 && (
             <div className="rail-section">
               <span className="label">Can&rsquo;t be placed ({diag.unscheduled})</span>
@@ -585,11 +729,43 @@ function isNetworkFailure(e: unknown) {
   return !(e instanceof ApiError);
 }
 
-function describeError(e: unknown) {
-  if (e instanceof ApiError) {
-    const d = e.detail as { detail?: string } | string;
-    if (typeof d === "string") return d;
-    return d?.detail ?? `API error ${e.status}`;
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/**
+ * Reduce an API error to one line a coordinator can act on.
+ *
+ * Every branch must end at a string. FastAPI puts the payload under `detail`,
+ * and this API raises structured bodies as well as plain ones — the 409 for a
+ * stored dataset that predates the time model carries `{error, message,
+ * missing}`, and the 422 for an unsolvable week carries `{solver,
+ * constraints}`. The previous version was typed as returning a string but
+ * handed those objects straight back, and an object rendered as a React child
+ * throws — so the two errors the backend works hardest to explain were
+ * precisely the two that took the whole console down instead of showing.
+ */
+function describeError(e: unknown): string {
+  if (!(e instanceof ApiError)) {
+    return e instanceof Error ? e.message : String(e);
   }
-  return e instanceof Error ? e.message : String(e);
+  const detail =
+    isRecord(e.detail) && "detail" in e.detail ? e.detail.detail : e.detail;
+
+  if (typeof detail === "string") return detail;
+  // Pydantic reports request-validation failures as a list of problems.
+  if (Array.isArray(detail)) {
+    const first = detail.find(isRecord);
+    if (first && typeof first.msg === "string") return first.msg;
+  }
+  if (isRecord(detail)) {
+    // The stale-dataset 409 writes the remedy into `message`.
+    if (typeof detail.message === "string") return detail.message;
+    // For an unsolvable week the solver's own note explains it best: it is
+    // the text that distinguishes a timeout from a real infeasibility.
+    if (isRecord(detail.solver) && typeof detail.solver.note === "string") {
+      return detail.solver.note;
+    }
+  }
+  return `API error ${e.status}`;
 }

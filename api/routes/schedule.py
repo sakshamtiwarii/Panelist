@@ -37,19 +37,46 @@ def generate(req: GenerateRequest, _=Depends(require_coordinator)):
             rooms=req.rooms, days=req.days, load_factor=req.load_factor,
         )
         write_dataset(out, dataset, report)
-    except (ValueError, OSError) as e:
-        raise HTTPException(500, f"generator failed: {e}")
+    except ValueError as e:
+        # The settings are wrong, not the server: a 500 here sends the caller
+        # looking for a fault that is in their own request body.
+        raise HTTPException(400, f"invalid generator settings: {e}")
+    except OSError as e:
+        raise HTTPException(500, f"could not write dataset to {out}: {e}")
     return {
         "dataset": req.name, "seed": req.seed, "path": out,
         "density_report": report,
     }
 
 
+def check_overrides(overrides, companies):
+    """Refuse an override that names a company the dataset does not have.
+
+    Dropping it silently would leave the coordinator believing they had
+    protected a company while the solver went on applying the tier default —
+    the exact "silently deprioritize a company" the guide rules out.
+    """
+    known = {c["id"] for c in companies}
+    unknown = sorted(set(overrides) - known)
+    if unknown:
+        raise HTTPException(400, {
+            "error": "unknown_company_in_priority_overrides",
+            "message": (
+                f"No company with id {', '.join(unknown[:5])} in this "
+                f"dataset, so that priority override cannot be applied."
+            ),
+            "unknown": unknown,
+        })
+    return {cid: level for cid, level in overrides.items() if level != "normal"}
+
+
 @router.post("/schedule")
 def create_schedule(req: ScheduleRequest, _=Depends(require_coordinator)):
     ds = read_dataset_file(req.dataset)
+    overrides = check_overrides(req.priority_overrides, ds["companies"])
     model = SchedulingModel(
-        ds["companies"], ds["students"], ds["rooms"], ds["config"]
+        ds["companies"], ds["students"], ds["rooms"], ds["config"],
+        priority_overrides=overrides,
     ).build()
     status, solver = model.solve(time_limit_seconds=req.time_limit_seconds)
     report = model.status_report(status, solver)
@@ -78,6 +105,14 @@ def create_schedule(req: ScheduleRequest, _=Depends(require_coordinator)):
         "unscheduled": len(unscheduled),
         "version": version,
         "store": store.kind,
+        # Echoed back so the coordinator can see which exceptions were in
+        # force for this solve rather than inferring it from the board.
+        "priority_overrides": overrides,
+        "priority_reasons": {
+            cid: model.constraint_reasons[f"priority_override:{cid}"]
+            for cid in overrides
+            if f"priority_override:{cid}" in model.constraint_reasons
+        },
     }
 
 

@@ -255,14 +255,42 @@ off against each other, zero clashes and cutoff compliance win first.
 **When infeasible, which constraint bends first?**
 CGPA cutoffs and no-double-booking constraints are never violated — they're
 business rules and safety constraints. Exact time-slot placement is the
-soft constraint that shifts first. If that's still not enough, the choice
-is surfaced to the coordinator via priority-tier override rather than
-silently decided by the algorithm.
+soft constraint that shifts first. When even that isn't enough and some
+interviews must go unplaced, the algorithm's default is the tier order: a
+tier-1 mass recruiter is protected ahead of a tier-3 niche company.
+
+That default is a policy decision, so it is overridable. `priority_overrides`
+on `POST /schedule` and `POST /replan` — and the **Priority overrides** panel
+in the console — let a coordinator *protect* a company above the tier order or
+*drop it first* below it. Protection outranks any tier difference and any
+churn penalty, so a protected company is kept even when keeping it forces a
+reshuffle; dropping first leaves a weight of 1 rather than 0, so the company
+still fills spare capacity instead of being excluded outright. An override
+naming a company the dataset doesn't have is refused rather than ignored,
+because silently discarding it would leave the coordinator believing they had
+acted.
+
+The division is the point: the algorithm decides the default, the coordinator
+decides the exceptions, and neither silently overrules the other.
+
+On a 316-interview instance oversubscribed 3x, the default drops one tier-3
+company entirely (0 of 17 placed). Protecting it places 9 of 17 — and costs 26
+interviews elsewhere. That trade is the coordinator's to make, and the console
+shows both numbers before it is made.
 
 **How much reshuffling is acceptable during a replan?**
 Churn is capped (default 10% of the day's appointments, configurable). If a
 fix requires exceeding that, it's surfaced to the coordinator to confirm or
 request a looser fix — never auto-applied silently.
+
+The looser fix is real, not a promise: exceeding the cap triggers a second
+solve at a 40x stability weight, and when that finds a meaningfully cheaper
+schedule both are returned and either can be committed
+(`POST /replan/apply {"use_alternative": true}`). The console shows them side
+by side with the trade stated — one measured example: 13 interviews moved
+leaving 6 unplaced, against 10 moved leaving 10 unplaced. When re-solving
+finds nothing cheaper the replanner says so explicitly (`churn_irreducible`)
+rather than offering a choice that isn't one.
 
 ## Datasets
 
@@ -357,9 +385,11 @@ company, student) · `GET /metrics` · `GET /diagnostics` · `GET /affected` ·
 
 - **Generator** — done. Seeded, reproducible, with conflict-density readout.
 - **Scheduler** — done. CP-SAT model, metrics, capacity diagnostics,
-  independent verification.
+  independent verification, and coordinator priority overrides on top of the
+  tier default.
 - **Replanner** — done. Four disruption types, compound events, minimal-churn
-  re-solve, structured diff, notify list, churn cap with authorization flow.
+  re-solve, structured diff, notify list, churn cap with authorization flow,
+  and a lower-churn alternative the coordinator can commit instead.
 - **API** — done. Propose/apply separation verified end to end.
 - **Persistence** — done. Postgres-backed versioned schedules, impact queries
   and replan audit trail, with an in-memory fallback.
