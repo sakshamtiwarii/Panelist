@@ -157,7 +157,7 @@ project:
 | Service | Setting |
 |---|---|
 | Postgres | Add from Railway's Postgres template |
-| API | Root Directory `/` — `railway.json` points it at `api/Dockerfile` |
+| API | Root Directory `/`, Dockerfile Path `api/Dockerfile` |
 | Console | Root Directory `dashboard` — auto-detected as Next.js |
 
 On the **API** service:
