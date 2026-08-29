@@ -1,9 +1,6 @@
 # Panelist
 
-A placement-week scheduling and disruption-replanning system, built for the
-Mirai Labs Software Developer Intern take-home assignment.
-
-Full design spec, rationale, and defense prep: see `PLACEMENT_SCHEDULER_GUIDE.md`.
+A placement-week scheduling and disruption-replanning system.
 
 ## What this is
 
