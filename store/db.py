@@ -34,7 +34,18 @@ def open_store(url=None, quiet=False, attempts=10, delay=1.5):
     persistence for the whole run while every request still succeeded.
     """
     url = url or os.environ.get("DATABASE_URL")
+    # The in-memory fallback keeps a single long-lived process serving when the
+    # database is down. On serverless it does the opposite: every instance gets
+    # its own empty store, so a schedule appears and vanishes depending on
+    # which one answers. PANELIST_REQUIRE_DB=1 makes an unreachable database a
+    # startup failure instead — visible, rather than quietly incoherent.
+    require_db = os.environ.get("PANELIST_REQUIRE_DB") == "1"
     if not url:
+        if require_db:
+            raise RuntimeError(
+                "PANELIST_REQUIRE_DB=1 but DATABASE_URL is unset. Point it at "
+                "a database, or unset PANELIST_REQUIRE_DB to run in memory."
+            )
         if not quiet:
             print("[store] DATABASE_URL unset — using in-memory store")
         return MemoryStore()
@@ -54,6 +65,11 @@ def open_store(url=None, quiet=False, attempts=10, delay=1.5):
                     print(f"[store] Postgres not ready, retrying for "
                           f"{attempts * delay:.0f}s…")
                 time.sleep(delay)
+    if require_db:
+        raise RuntimeError(
+            f"PANELIST_REQUIRE_DB=1 and Postgres was unreachable after "
+            f"{attempts} attempts: {last}"
+        )
     if not quiet:
         print(f"[store] Postgres unavailable after {attempts} attempts "
               f"({last}) — using in-memory store")
@@ -131,27 +147,42 @@ class MemoryStore:
         return versions[-1]["version"] if versions else None
 
     def current_dataset(self):
-        for name, versions in self._schedules.items():
-            if versions:
-                return name
-        return None
+        """The most recently solved dataset, or None.
+
+        Returning "the first one that has a schedule" made the answer depend on
+        insertion order the moment a second dataset existed — which a demo-seeded
+        deployment reaches as soon as anyone solves a different one.
+        """
+        live = [(v[-1]["created_at"], v[-1]["version"], name)
+                for name, v in self._schedules.items() if v]
+        return max(live)[2] if live else None
 
     # -- replan audit ----------------------------------------------------
     def record_replan(self, dataset, disruptions, proposal, to_version):
         d = proposal["diff"]
+        # `disruptions` is accepted and not stored: PostgresStore keeps it as
+        # forensics in a column nothing reads back, and inventing a key here
+        # that the other store cannot produce is what put the two shapes out
+        # of step in the first place.
         self._replans.setdefault(dataset, []).append({
-            "to_version": to_version,
-            "disruptions": disruptions,
+            "applied_at": datetime.datetime.now(datetime.timezone.utc),
             "descriptions": proposal["disruptions_applied"],
             "elective_churn": d["elective_churn_count"],
             "forced_churn": d["forced_churn_count"],
             "churn_pct": d["elective_churn_pct"],
             "cap_exceeded": bool(proposal.get("cap_exceeded")),
             "notify_count": proposal["notify"]["total_people_to_contact"],
+            "schedule_id": to_version,
         })
 
     def replan_history(self, dataset, limit=20):
-        return list(reversed(self._replans.get(dataset, [])))[:limit]
+        """Newest first, with the same keys PostgresStore returns.
+
+        Same contract as `versions`: /replan/history must not answer
+        differently depending on whether the database was reachable.
+        """
+        rows = list(reversed(self._replans.get(dataset, [])))[:limit]
+        return [{**e, "applied_at": e["applied_at"].isoformat()} for e in rows]
 
     # -- proposals -------------------------------------------------------
     def put_proposal(self, pid, dataset, payload, ttl_minutes=30):
@@ -538,7 +569,10 @@ class PostgresStore:
         depending on having served the request that solved it.
         """
         with self._tx() as cur:
-            cur.execute("SELECT dataset FROM schedules WHERE is_current LIMIT 1")
+            # Newest first: `is_current` is per dataset, so several can carry
+            # one at once and an unordered LIMIT 1 picks arbitrarily.
+            cur.execute("SELECT dataset FROM schedules WHERE is_current "
+                        "ORDER BY created_at DESC, id DESC LIMIT 1")
             row = cur.fetchone()
         return row[0] if row else None
 

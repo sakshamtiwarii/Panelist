@@ -47,9 +47,15 @@ CREATE TABLE IF NOT EXISTS students (
     PRIMARY KEY (dataset, id)
 );
 
--- The shortlist relation is the thing that makes the problem hard, so it gets
--- to be a real table rather than an array column: it is the join that answers
--- contention questions ("which companies compete for this student").
+-- The shortlist relation is a real table rather than an array column so the
+-- membership can be amended one pair at a time — which is what a mid-week
+-- roster change actually is — and so the foreign keys below can cascade a
+-- withdrawn company's entries away.
+--
+-- No secondary index: every query against this table reads a whole dataset's
+-- rows (`WHERE dataset = %s`), which the primary key's leading column already
+-- serves. A (dataset, student_id) index was here for a per-student contention
+-- query that is computed in Python, and cost a write on every shortlist row.
 CREATE TABLE IF NOT EXISTS shortlists (
     dataset    TEXT NOT NULL,
     company_id TEXT NOT NULL,
@@ -58,7 +64,9 @@ CREATE TABLE IF NOT EXISTS shortlists (
     FOREIGN KEY (dataset, company_id) REFERENCES companies(dataset, id) ON DELETE CASCADE,
     FOREIGN KEY (dataset, student_id) REFERENCES students(dataset, id)  ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS shortlists_student_idx ON shortlists (dataset, student_id);
+-- Removes it from databases created before it was dropped. This file is
+-- re-run on every connect, and the statement is a no-op once it is gone.
+DROP INDEX IF EXISTS shortlists_student_idx;
 
 CREATE TABLE IF NOT EXISTS rooms (
     dataset         TEXT  NOT NULL REFERENCES datasets(name) ON DELETE CASCADE,

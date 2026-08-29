@@ -4,6 +4,8 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 
 from api.auth import (
     COOKIE_NAME,
+    COOKIE_SAMESITE,
+    COOKIE_SECURE,
     SESSION_HOURS,
     current_user,
     issue_token,
@@ -30,7 +32,8 @@ def login(req: LoginRequest, response: Response):
         COOKIE_NAME,
         issue_token(user["username"], user["role"]),
         httponly=True,          # page JavaScript can never read the session
-        samesite="lax",
+        samesite=COOKIE_SAMESITE,
+        secure=COOKIE_SECURE,
         max_age=SESSION_HOURS * 3600,
         path="/",
     )

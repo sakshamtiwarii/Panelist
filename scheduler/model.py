@@ -38,6 +38,7 @@ reason (see `diagnose_unscheduled`). That is a more specific and more useful
 diagnostic than a solver-level infeasibility certificate.
 """
 
+import os
 from collections import defaultdict
 
 from ortools.sat.python import cp_model
@@ -61,6 +62,14 @@ from scheduler import timegrid
 PRIORITY_LEVELS = ("protect", "normal", "deprioritise")
 PROTECT_BONUS = 100
 DEPRIORITISED_WEIGHT = 1
+
+
+def default_workers():
+    """How many search workers to give CP-SAT."""
+    override = os.environ.get("PANELIST_SOLVER_WORKERS")
+    if override and override.isdigit() and int(override) > 0:
+        return int(override)
+    return max(1, min(8, os.cpu_count() or 1))
 
 
 def panels_available(company, at):
@@ -480,10 +489,18 @@ class SchedulingModel:
 
     # -- solving ------------------------------------------------------------
 
-    def solve(self, time_limit_seconds=30, workers=8):
+    def solve(self, time_limit_seconds=30, workers=None):
+        """Solve, with the worker count matched to the machine.
+
+        A hardcoded 8 is wrong in both directions: on a one-vCPU serverless
+        instance it oversubscribes a single core, and on a bigger host it
+        leaves cores idle. PANELIST_SOLVER_WORKERS overrides for a container
+        whose CPU quota is smaller than the host's core count — `os.cpu_count`
+        reports the machine, not the cgroup limit.
+        """
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = time_limit_seconds
-        solver.parameters.num_search_workers = workers
+        solver.parameters.num_search_workers = workers or default_workers()
         status = solver.Solve(self.model)
         return status, solver
 

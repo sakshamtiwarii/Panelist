@@ -474,11 +474,13 @@ def build_dataset(seed=42, companies=35, students=800, rooms=20, days=4,
 
 
 def write_dataset(out, dataset, report):
-    """Write the dataset and its density report to `out/`."""
+    """Write the dataset and its density report to `out/`.
+
+    `dataset.json` alone — it already contains the companies, students and
+    rooms. This used to also emit those three as separate files, which nothing
+    in the project ever read back.
+    """
     os.makedirs(out, exist_ok=True)
-    for name in ("companies", "students", "rooms"):
-        with open(os.path.join(out, f"{name}.json"), "w") as f:
-            json.dump(dataset[name], f, indent=2)
     with open(os.path.join(out, "dataset.json"), "w") as f:
         json.dump(dataset, f, indent=2)
     with open(os.path.join(out, "density_report.txt"), "w") as f:

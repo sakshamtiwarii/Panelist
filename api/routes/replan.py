@@ -75,7 +75,8 @@ def propose(events, churn_cap_pct, time_limit_seconds, now_slot=None,
         # trade-off against churn, and the number the alternative usually
         # pays in exchange for moving less.
         "unscheduled": len(proposal["unscheduled"]),
-        "has_alternative": "alternative" in proposal,
+        # The summary's presence is the flag; a separate boolean alongside it
+        # was two ways to say the same thing, and only one was ever read.
         "alternative": _summarise_alternative(proposal.get("alternative")),
         "priority_overrides": overrides,
     }

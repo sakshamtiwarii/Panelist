@@ -48,13 +48,13 @@ services:
       - "${PANELIST_API_PORT:-8000}:8000"
     environment:
       DATABASE_URL: postgresql://panelist:panelist@db:5432/panelist
-      # The browser's origin is the published host port, not the container's.
       # Signing key for session cookies. The compose default is fine for a
       # local demo; a real deployment must set its own, or every restart
       # invalidates all sessions.
       PANELIST_SECRET_KEY: ${PANELIST_SECRET_KEY:-panelist-local-demo-key}
-      PANELIST_CORS_ORIGINS: >-
-        http://localhost:${PANELIST_WEB_PORT:-3000},http://127.0.0.1:${PANELIST_WEB_PORT:-3000}
+      # No PANELIST_CORS_ORIGINS: the dashboard proxies to this service
+      # server-side, so nothing the browser sends here is cross-origin. The
+      # middleware stays in api/main.py for anyone calling the API directly.
     depends_on:
       db:
         condition: service_healthy
@@ -74,9 +74,12 @@ services:
       # e.g. PANELIST_WEB_PORT=3001 docker compose up
       - "${PANELIST_WEB_PORT:-3000}:3000"
     environment:
-      # Resolved in the browser, not in the container, so it points at the
-      # published host port rather than the compose service name.
-      NEXT_PUBLIC_API_URL: http://localhost:${PANELIST_API_PORT:-8000}
+      # Resolved inside the container, not in the browser: the dashboard
+      # forwards /api/* to the solver over the compose network, so the page
+      # and the API share one origin. That removes the whole class of "opened
+      # the wrong published port and every fetch fails CORS" problems — the
+      # browser never learns the API's address at all.
+      PANELIST_API_ORIGIN: http://api:8000
     depends_on:
       - api
 

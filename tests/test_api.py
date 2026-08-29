@@ -36,6 +36,9 @@ def client(tmp_path_factory):
     # Both variables are read at import time, so they must be set first.
     os.environ.pop("DATABASE_URL", None)
     os.environ["PANELIST_DATA"] = str(data_root)
+    # No first-boot demo seed: this suite's whole point is a fixed, known
+    # input, and seeding would put a second (larger) dataset alongside it.
+    os.environ["PANELIST_DEMO_SEED"] = "0"
     from api.main import app
     return TestClient(app)
 
@@ -231,7 +234,7 @@ def test_applying_a_missing_alternative_is_refused_clearly(coordinator, solved):
     }).json()
     if not proposed["ok"]:
         pytest.skip("disruption infeasible on this dataset")
-    if proposed["has_alternative"]:
+    if proposed["alternative"]:
         pytest.skip("this proposal does have an alternative")
 
     r = coordinator.post("/replan/apply", json={
@@ -252,7 +255,7 @@ def test_a_proposal_reports_what_it_leaves_unplaced(coordinator, solved):
         pytest.skip("disruption infeasible on this dataset")
     assert isinstance(proposed["unscheduled"], int)
     # And when an alternative is offered, both sides of the choice are costed.
-    if proposed["has_alternative"]:
+    if proposed["alternative"]:
         alt = proposed["alternative"]
         assert {"elective_churn_count", "unscheduled"} <= set(alt)
         assert alt["elective_churn_count"] < proposed["diff"]["elective_churn_count"]

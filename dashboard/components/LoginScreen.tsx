@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import {
-  API_BASE, ApiError, api, diagnoseReachability, type Session,
+  ApiError, api, type Session,
 } from "@/lib/api";
 
 /**
@@ -53,19 +53,13 @@ export default function LoginScreen({
             : `The API replied ${err.status}. ${String(err.message).slice(0, 160)}`,
         );
       } else {
-        // No HTTP response at all. Tell a dead API apart from an origin the
-        // API refuses — the browser reports both identically, and the second
-        // is nearly always the dashboard being opened on the wrong port.
-        const why = await diagnoseReachability();
-        const origin =
-          typeof window !== "undefined" ? window.location.origin : "this page";
+        // No HTTP response at all. This request is same-origin — the page's
+        // own server proxies it onward — so the only way to get here is that
+        // server being gone, which means the browser cannot have loaded this
+        // page from it either. In practice: a dev server that died mid-session.
         setError(
-          why === "origin-rejected"
-            ? `The API at ${API_BASE} is running but refuses requests from ` +
-              `${origin}. You are probably on the wrong port — check the ` +
-              `dashboard row of \`docker compose ps\` and open that address.`
-            : `Nothing is answering at ${API_BASE}. Start it with ` +
-              `\`docker compose up\`, then reload.`,
+          "Lost contact with the console's own server. Start it with " +
+            "`docker compose up`, then reload this page.",
         );
       }
     } finally {

@@ -5,6 +5,10 @@ __pycache__/
 venv/
 *.egg-info/
 
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+
 # Generated datasets & solver output
 data/
 *.solution.json

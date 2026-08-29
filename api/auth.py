@@ -42,6 +42,15 @@ from fastapi import Cookie, Depends, HTTPException
 COOKIE_NAME = "panelist_session"
 SESSION_HOURS = 12
 
+# Marks the session cookie HTTPS-only. On by default whenever the deployment
+# says it is served over TLS; off locally, where http://localhost would
+# otherwise drop the cookie silently and make login look broken.
+COOKIE_SECURE = os.environ.get("PANELIST_COOKIE_SECURE", "0") == "1"
+# "lax" is right while the page and the API share an origin, which is how the
+# dashboard proxies them in a deployment. Only a split-origin deployment needs
+# "none", and that additionally requires COOKIE_SECURE.
+COOKIE_SAMESITE = os.environ.get("PANELIST_COOKIE_SAMESITE", "lax")
+
 _SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1, "dklen": 32}
 
 _env_secret = os.environ.get("PANELIST_SECRET_KEY")

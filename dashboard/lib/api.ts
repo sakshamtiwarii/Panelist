@@ -1,11 +1,14 @@
-const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Relative in every environment — next.config.mjs supplies "/api" and the
+// route handler behind it forwards to the solver. Absolute only when someone
+// deliberately points the console at an API directly.
+const BASE = process.env.NEXT_PUBLIC_API_URL || "/api";
 
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     ...init,
     headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
-    // The session is an httpOnly cookie, so it only travels when credentials
-    // are explicitly included on a cross-origin request.
+    // The session is an httpOnly cookie. Harmless while the call is
+    // same-origin, and required the moment someone points BASE elsewhere.
     credentials: "include",
     cache: "no-store",
   });
@@ -15,31 +18,6 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(res.status, detail);
   }
   return res.json() as Promise<T>;
-}
-
-/** The API base this build talks to — shown in diagnostics. */
-export const API_BASE = BASE;
-
-export type Reachability = "unreachable" | "origin-rejected";
-
-/**
- * Tell a dead API apart from a CORS rejection.
- *
- * A browser reports both as the same `TypeError: Failed to fetch` on purpose —
- * leaking which one it was would let a page probe cross-origin servers. A
- * `no-cors` request sidesteps that: the response is opaque and unreadable, but
- * it RESOLVES when the server answered and REJECTS when nothing was listening.
- * That is enough to tell the coordinator whether the API is down or whether
- * this page is simply on an origin the API does not allow — usually the wrong
- * port, which otherwise looks identical to a crashed backend.
- */
-export async function diagnoseReachability(): Promise<Reachability> {
-  try {
-    await fetch(`${BASE}/health`, { mode: "no-cors", cache: "no-store" });
-    return "origin-rejected";
-  } catch {
-    return "unreachable";
-  }
 }
 
 export class ApiError extends Error {
@@ -75,6 +53,8 @@ export const api = {
   schedule: () => call<{ count: number; appointments: Appointment[] }>("/schedule"),
   metrics: () => call<Metrics>("/metrics"),
   diagnostics: () => call<Diagnostics>("/diagnostics"),
+  versions: () => call<{ versions: ScheduleVersion[] }>("/schedule/versions"),
+  history: () => call<{ events: ReplanEvent[] }>("/replan/history"),
   propose: (body: ReplanBody) =>
     call<Proposal>("/replan", { method: "POST", body: JSON.stringify(body) }),
   apply: (proposalId: string, useAlternative = false) =>
@@ -162,6 +142,28 @@ export interface Appointment {
   slot: number;
   room: string | null;
   panel: number;
+}
+
+/** One entry in the schedule's version history. */
+export interface ScheduleVersion {
+  version: number;
+  origin: string;          // "solve" | "replan"
+  solver_status: string | null;
+  is_current: boolean;
+  created_at: string;
+  appointments: number;
+}
+
+/** One applied replan: what caused it and what it cost. */
+export interface ReplanEvent {
+  applied_at: string;
+  descriptions: string[];
+  elective_churn: number;
+  forced_churn: number;
+  churn_pct: number;
+  cap_exceeded: boolean;
+  notify_count: number;
+  schedule_id: number | null;
 }
 
 export interface Metrics {
@@ -323,7 +325,6 @@ export interface Proposal {
   authorization_prompt?: string | null;
   verification_errors?: string[];
   unscheduled?: number;
-  has_alternative?: boolean;
   alternative?: AlternativeSummary | null;
   priority_overrides?: PriorityOverrides;
 }

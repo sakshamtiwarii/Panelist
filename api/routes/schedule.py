@@ -70,35 +70,57 @@ def check_overrides(overrides, companies):
     return {cid: level for cid, level in overrides.items() if level != "normal"}
 
 
-@router.post("/schedule")
-def create_schedule(req: ScheduleRequest, _=Depends(require_coordinator)):
-    ds = read_dataset_file(req.dataset)
-    overrides = check_overrides(req.priority_overrides, ds["companies"])
+def solve_and_store(name, ds, time_limit_seconds, priority_overrides=None):
+    """Solve a dataset and adopt the result as the live schedule.
+
+    Shared by POST /schedule and the first-boot demo seed. Both have to persist
+    the same things in the same order — the dataset before the schedule, the
+    cache stamped with the version the write produced — and two copies of that
+    sequence is how a seeded deployment ends up subtly unlike a solved one.
+
+    Returns a dict; `usable` is False when the solver found nothing, leaving
+    the caller to decide whether that is a 422 or a logged warning.
+    """
     model = SchedulingModel(
         ds["companies"], ds["students"], ds["rooms"], ds["config"],
-        priority_overrides=overrides,
+        priority_overrides=priority_overrides,
     ).build()
-    status, solver = model.solve(time_limit_seconds=req.time_limit_seconds)
+    status, solver = model.solve(time_limit_seconds=time_limit_seconds)
     report = model.status_report(status, solver)
     if not report["usable"]:
-        raise HTTPException(422, {
-            "solver": report,
-            "constraints": model.constraint_reasons,
-        })
+        return {"usable": False, "report": report, "model": model}
 
     scheduled, unscheduled = model.extract_schedule(solver)
     errors = model.verify_schedule(scheduled)
-    metrics = compute_metrics(
-        scheduled, unscheduled, ds["rooms"], ds["config"]
-    )
-    store.put_dataset(req.dataset, ds)
+    metrics = compute_metrics(scheduled, unscheduled, ds["rooms"], ds["config"])
+    store.put_dataset(name, ds)
     version = store.put_schedule(
-        req.dataset, scheduled, [u["id"] for u in unscheduled],
+        name, scheduled, [u["id"] for u in unscheduled],
         report, metrics, origin="solve",
     )
     # Adopted with the version it belongs to, after the write that created it,
     # so the cache is trusted rather than re-fetched on the next read.
-    set_loaded(req.dataset, ds, version)
+    set_loaded(name, ds, version)
+    return {
+        "usable": True, "report": report, "model": model, "metrics": metrics,
+        "scheduled": scheduled, "unscheduled": unscheduled,
+        "errors": errors, "version": version,
+    }
+
+
+@router.post("/schedule")
+def create_schedule(req: ScheduleRequest, _=Depends(require_coordinator)):
+    ds = read_dataset_file(req.dataset)
+    overrides = check_overrides(req.priority_overrides, ds["companies"])
+    out = solve_and_store(req.dataset, ds, req.time_limit_seconds, overrides)
+    if not out["usable"]:
+        raise HTTPException(422, {
+            "solver": out["report"],
+            "constraints": out["model"].constraint_reasons,
+        })
+    report, model = out["report"], out["model"]
+    scheduled, unscheduled = out["scheduled"], out["unscheduled"]
+    errors, metrics, version = out["errors"], out["metrics"], out["version"]
     return {
         "solver": report,
         "metrics": metrics,

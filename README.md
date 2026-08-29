@@ -138,6 +138,55 @@ rather than silent — a live demo should not open with a connection error.
 On startup the API adopts any schedule that outlived the last process, so a
 restart comes back with the week already planned rather than needing a re-solve.
 
+## Deploying it
+
+Two pieces: a Next.js console and a Python solver — the solver being a
+long-running process carrying a 70 MB OR-Tools binary, which is what decides
+where this is comfortable to host.
+
+**Deployed on Railway.** The point of hosting this at all is that a reviewer
+opens a link and the console is *already there*, so a platform that sleeps its
+free tier and takes a minute to wake would defeat the exercise. Railway only
+sleeps a service if you turn its Serverless feature on. The $5 trial credit
+covers a 30-day review window; after that it is the $5/month Hobby plan, since
+the Free plan's $1/month credit will not keep a service up.
+
+**New Project → Deploy from GitHub repo**, then add three services in one
+project:
+
+| Service | Setting |
+|---|---|
+| Postgres | Add from Railway's Postgres template |
+| API | Root Directory `/` — `railway.json` points it at `api/Dockerfile` |
+| Console | Root Directory `dashboard` — auto-detected as Next.js |
+
+On the **API** service:
+
+```
+DATABASE_URL          ${{Postgres.DATABASE_URL}}
+PANELIST_SECRET_KEY   any long random string
+PANELIST_REQUIRE_DB   1
+PANELIST_COOKIE_SECURE 1
+```
+
+On the **Console** service, one variable pointing at the API:
+
+```
+PANELIST_API_ORIGIN   https://<your-api>.up.railway.app
+```
+
+Generate a public domain for the console. The API needs one too on this path,
+since that is what `PANELIST_API_ORIGIN` points at.
+
+You can instead keep the solver off the public internet entirely by pointing
+the console at Railway's private network
+(`http://<api-service>.railway.internal:8000`) and giving it no public domain.
+That network resolves over IPv6, so the API must listen there —
+`PANELIST_HOST=::`. Be aware that this is IPv6-**only**, not dual-stack:
+asyncio does not clear `IPV6_V6ONLY`, so a service bound to `::` refuses IPv4
+outright. Use it only when nothing reaches the API over IPv4, which rules out
+giving it a public domain as well.
+
 ## Running it
 
 ```bash
@@ -157,16 +206,17 @@ the host port on the left of `->3000`:
 dashboard   running   0.0.0.0:3001->3000/tcp     # open :3001, not :3000
 ```
 
-The API allows requests from exactly the origin it published the dashboard on,
-so opening the wrong port fails every fetch with a CORS error rather than a
-404 — the console detects this case and says so, but it is worth knowing.
+Only the dashboard's port matters. The console reaches the solver over the
+compose network (`http://api:8000`) and forwards `/api/*` to it server-side, so
+the browser never learns the API's address and the published API port can be
+anything without breaking a fetch. The API port below exists for `curl` and
+the OpenAPI docs, not for the console.
 
-These are the defaults; if you have a `.env` with port overrides (see below),
-use the ports it sets instead.
-
-Then `POST /schedule` (or press **Build schedule** in the dashboard) to solve.
-A fresh clone has no dataset — `data/` is gitignored — so run the generator
-first, or `POST /generate`.
+**Nothing to set up first.** The API generates the documented dataset and
+solves it on first boot, so the console opens on a full board. That takes about
+three seconds and only happens when no schedule exists — a restart adopts the
+stored one instead. Set `PANELIST_DEMO_SEED=0` to skip it and build your own
+with **Build schedule** or `POST /generate`.
 
 **Port overrides.** Dev machines routinely already run something on 3000, 8000
 or 5432, and Docker publishes on `0.0.0.0`, so it collides with any local
@@ -306,13 +356,24 @@ rather than offering a choice that isn't one.
 
 ## Datasets
 
-The generator emits three datasets, all from seed 42, all reproducible:
+Three datasets, all from seed 42, all reproducible — the command is the
+definition, so the figures can be checked rather than taken on trust:
 
-| Path | Interviews | Load | Purpose |
+| Path | Interviews | Load | Generate with |
 |---|---|---|---|
-| `data/small` | 114 | 0.67 | fast solver iteration |
-| `data/primary` | 1013 | 0.90 | hard but fully solvable |
-| `data/oversubscribed` | 2770 | 2.46 | realistic sizes; infeasible by construction |
+| `data/small` | 84 | 0.50 | `--companies 6 --students 40 --rooms 3 --days 4` |
+| `data/primary` | 1013 | 0.90 | `--companies 35 --students 800 --rooms 20 --days 4 --load-factor 0.9` |
+| `data/oversubscribed` | 2770 | 2.46 | `--companies 35 --students 800 --rooms 20 --days 4` |
+
+```bash
+python -m generator.generate --seed 42 <args from the table> --out ./data/<name>
+```
+
+`small` is for fast solver iteration and is what CI generates; `primary` is
+hard but fully solvable; `oversubscribed` omits `--load-factor` entirely, which
+is the generator's natural output at these sizes and is infeasible by
+construction — the honest answer to "can you interview every shortlisted
+student in one week".
 
 Each run writes a `density_report.txt` confirming the instance is actually
 hard before any solver runs: shortlist distribution, the CGPA/shortlist
