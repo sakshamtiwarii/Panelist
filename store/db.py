@@ -126,6 +126,10 @@ class MemoryStore:
             "appointments": len(e["scheduled"]),
         } for e in reversed(versions)]
 
+    def current_version(self, dataset):
+        versions = self._schedules.get(dataset)
+        return versions[-1]["version"] if versions else None
+
     def current_dataset(self):
         for name, versions in self._schedules.items():
             if versions:
@@ -164,8 +168,16 @@ class MemoryStore:
         return row["payload"]
 
     def clear_proposals(self, dataset):
+        """Drop this dataset's pending proposals, and any expired ones.
+
+        The expired half matches PostgresStore's "OR expires_at <= now()":
+        without it a long-lived process accumulates proposals for datasets it
+        has moved on from, which `get_proposal` only ever clears if something
+        happens to ask for them by id again.
+        """
+        now = time.time()
         for pid, row in list(self._proposals.items()):
-            if row["dataset"] == dataset:
+            if row["dataset"] == dataset or row["expires"] < now:
                 del self._proposals[pid]
 
     # -- users -----------------------------------------------------------
@@ -275,14 +287,22 @@ class PostgresStore:
                 "INSERT INTO datasets (name, seed, config) VALUES (%s, %s, %s)",
                 (name, ds["meta"]["seed"], json.dumps(ds["config"])),
             )
+            # The disruption columns are written here as well as in
+            # amend_dataset. They default to '[]', so omitting them silently
+            # dropped a company's lateness windows and panel blackouts on any
+            # dataset that already carried them — and MemoryStore, which keeps
+            # the dict as given, disagreed with Postgres about the same input.
             cur.executemany(
                 """INSERT INTO companies (dataset, id, name, tier, cgpa_cutoff,
                        panel_count, interview_minutes, duration_slots,
-                       preferred_day, shortlist_size)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                       preferred_day, shortlist_size, unavailable_windows,
+                       panel_blackouts)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 [(name, c["id"], c["name"], c["tier"], c["cgpa_cutoff"],
                   c["panel_count"], c["interview_minutes"], c["duration_slots"],
-                  c.get("preferred_day"), c["shortlist_size"])
+                  c.get("preferred_day"), c["shortlist_size"],
+                  json.dumps(c.get("unavailable_windows", [])),
+                  json.dumps(c.get("panel_blackouts", [])))
                  for c in ds["companies"]],
             )
             cur.executemany(
@@ -497,6 +517,20 @@ class PostgresStore:
                 "appointments": r[5],
             } for r in cur.fetchall()]
 
+    def current_version(self, dataset):
+        """Version of the live schedule, or None.
+
+        One indexed row. Exists so a caller can ask "has anything changed"
+        without loading a thousand appointments to find out — which is what
+        checking `get_current()` for the same answer costs.
+        """
+        with self._tx() as cur:
+            cur.execute(
+                "SELECT version FROM schedules WHERE dataset = %s AND is_current",
+                (dataset,))
+            row = cur.fetchone()
+        return row[0] if row else None
+
     def current_dataset(self):
         """The dataset that has a live schedule, or None.
 
@@ -517,11 +551,16 @@ class PostgresStore:
                 (dataset, to_version))
             row = cur.fetchone()
             to_id = row[0] if row else None
-            cur.execute(
-                "SELECT id FROM schedules WHERE dataset = %s AND version = %s",
-                (dataset, max(1, to_version - 1)))
-            row = cur.fetchone()
-            from_id = row[0] if row else None
+            # The version this replan built on. Clamping to 1 would make the
+            # first row claim it went from v1 to v1; there is simply no prior
+            # schedule to point at in that case.
+            from_id = None
+            if to_version > 1:
+                cur.execute(
+                    "SELECT id FROM schedules WHERE dataset = %s AND version = %s",
+                    (dataset, to_version - 1))
+                row = cur.fetchone()
+                from_id = row[0] if row else None
             cur.execute(
                 """INSERT INTO replan_events (dataset, from_schedule, to_schedule,
                        disruptions, descriptions, elective_churn, forced_churn,

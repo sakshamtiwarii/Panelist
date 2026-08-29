@@ -850,7 +850,6 @@ class SchedulingModel:
                 elif any(t in student_busy[iv["student_id"]] for t in window):
                     student_blocked += 1
 
-            total = len(starts)
             entry = findings[cid]
             entry["count"] += 1
             if panel_blocked >= max(room_blocked, student_blocked):
@@ -861,10 +860,6 @@ class SchedulingModel:
                 entry["causes"]["student_conflict"] += 1
             if len(entry["students"]) < 3:
                 entry["students"].append(iv["student_id"])
-            entry["_saturation"] = round(
-                100.0 * max(panel_blocked, room_blocked, student_blocked)
-                / max(1, total)
-            )
 
         # Per-company panel ceiling — an exact, checkable bound.
         report = []
@@ -992,4 +987,53 @@ class SchedulingModel:
                     f"{a['id']}: cgpa {student['cgpa']} below cutoff "
                     f"{company['cgpa_cutoff']}"
                 )
+
+        # Availability windows. Overlap and cutoffs were checked above; a room
+        # that is free by time can still be unavailable, and a company can be
+        # absent from an hour it has capacity in. Both enter the model as
+        # constraints and both are re-derived by the greedy colouring, which is
+        # exactly the code this method exists not to trust.
+        blocked = self._blocked_windows()
+        for a in scheduled:
+            rid = a.get("room")
+            if rid is not None:
+                for b0, b1 in blocked[rid]:
+                    if a["start"] < b1 and a["end"] > b0:
+                        errors.append(
+                            f"{a['id']}: room {rid} is blocked over "
+                            f"{self._window_label(b0, b1)}"
+                        )
+            company = self.company_by_id[a["company_id"]]
+            for w0, w1 in company.get("unavailable_windows", []):
+                if a["start"] < w1 and a["end"] > w0:
+                    errors.append(
+                        f"{a['id']}: {company['name']} is unavailable over "
+                        f"{self._window_label(w0, w1)}"
+                    )
+
+        # Panel capacity against mid-week blackouts. `_assign_panels` colours
+        # by index without knowing a panel walked out, so the index alone
+        # cannot show this: what matters is that the number running at once
+        # never exceeds the number still standing.
+        by_company = defaultdict(list)
+        for a in scheduled:
+            by_company[a["company_id"]].append(a)
+        for cid, items in by_company.items():
+            company = self.company_by_id[cid]
+            blackouts = company.get("panel_blackouts", [])
+            if not blackouts:
+                continue
+            for probe in items:
+                at = probe["start"]
+                concurrent = sum(1 for o in items if o["start"] <= at < o["end"])
+                available = company["panel_count"] - sum(
+                    1 for w0, w1 in blackouts if w0 <= at < w1
+                )
+                if concurrent > available:
+                    errors.append(
+                        f"{company['name']}: {concurrent} interview(s) "
+                        f"running at {self._window_label(at, at)} with only "
+                        f"{available} panel(s) still standing"
+                    )
+                    break
         return errors

@@ -30,17 +30,37 @@ DEFAULT_DATASET = os.environ.get("PANELIST_DATASET", "primary")
 store = open_store()
 
 # Cache only. Never the source of truth for anything that must survive.
-_cache = {"dataset": None, "name": None}
+#
+# `version` is what makes the cache safe to hold. FastAPI can be run with
+# several workers, and a replan that amends the roster is applied by exactly
+# one of them: without a stamp to check, every other worker keeps serving the
+# pre-amendment dataset for the rest of its life — a company added by a replan
+# never appears in its /config, and a replan it computes is built from a roster
+# that no longer exists.
+_cache = {"dataset": None, "name": None, "version": None}
+
+
+def _forget():
+    _cache.update({"dataset": None, "version": None})
 
 
 def dataset_name():
-    """Name of the dataset with a live schedule, or None."""
-    if _cache["name"]:
-        return _cache["name"]
+    """Name of the dataset with a live schedule, or None.
+
+    Asked of the store rather than remembered, so a worker notices when a
+    different dataset becomes live. Falls back to what this process adopted
+    only while the store has no current schedule at all — the window between
+    loading a dataset and solving it.
+    """
     name = store.current_dataset()
     if name:
-        _cache["name"] = name
-    return name
+        if _cache["name"] != name:
+            # A different dataset is live now; everything held about the old
+            # one describes a schedule that is no longer the current one.
+            _cache["name"] = name
+            _forget()
+        return name
+    return _cache["name"]
 
 
 def loaded_dataset():
@@ -55,8 +75,11 @@ def loaded_dataset():
     name = dataset_name()
     if not name:
         return None
-    if _cache["dataset"] is None:
+    # One indexed row, against holding a roster that another worker replaced.
+    version = store.current_version(name)
+    if _cache["dataset"] is None or _cache["version"] != version:
         _cache["dataset"] = store.get_dataset(name)
+        _cache["version"] = version
     ds = _cache["dataset"]
     if ds is not None:
         stale = timegrid.missing_keys(ds.get("config"))
@@ -78,13 +101,22 @@ def dataset_is_usable():
     name = dataset_name()
     if not name:
         return True
-    ds = store.get_dataset(name) if _cache["dataset"] is None else _cache["dataset"]
+    cached = _cache["dataset"]
+    if cached is not None and _cache["version"] == store.current_version(name):
+        ds = cached
+    else:
+        ds = store.get_dataset(name)
     return not timegrid.missing_keys((ds or {}).get("config"))
 
 
-def set_loaded(name, dataset):
-    """Adopt a dataset as the live one."""
-    _cache.update({"name": name, "dataset": dataset})
+def set_loaded(name, dataset, version=None):
+    """Adopt a dataset as the live one.
+
+    `version` is the schedule version this dict belongs to. Callers that do
+    not yet know it leave it None, which simply means the next read verifies
+    against the store instead of trusting the cache — safe either way.
+    """
+    _cache.update({"name": name, "dataset": dataset, "version": version})
 
 
 def current_schedule():

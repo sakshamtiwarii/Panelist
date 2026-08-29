@@ -164,6 +164,9 @@ def commit_replan(req: ApplyRequest, _=Depends(require_coordinator)):
         name, schedule, proposal["unscheduled"],
         proposal.get("solver"), metrics, origin="replan",
     )
+    # Re-stamp with the version the amended roster now belongs to: it was
+    # adopted above before this version existed.
+    set_loaded(name, ds, version)
     store.record_replan(name, proposal.get("_events", []), proposal, version)
 
     # Every other proposal was computed against a schedule that no longer

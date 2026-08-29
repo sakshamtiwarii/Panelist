@@ -26,7 +26,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.auth import current_user, seed_demo_users
 from api.deps import (
     DEFAULT_DATASET,
-    current_schedule,
     dataset_is_usable,
     dataset_name,
     loaded_dataset,
@@ -75,12 +74,16 @@ app.include_router(replan_routes.router)
 
 @app.get("/health")
 def health():
-    cur = current_schedule()
+    # The version alone answers both questions here. Reading the whole current
+    # schedule to learn that one number pulled every appointment out of the
+    # database on a call the dashboard makes on every load.
+    name = dataset_name()
+    version = store.current_version(name) if name else None
     return {
         "status": "ok",
-        "dataset_loaded": dataset_name(),
-        "has_schedule": cur is not None,
-        "schedule_version": cur["version"] if cur else None,
+        "dataset_loaded": name,
+        "has_schedule": version is not None,
+        "schedule_version": version,
         "store": store.kind,
         # False when the stored dataset predates the current time model:
         # a schedule exists but must be re-solved before it can be read.

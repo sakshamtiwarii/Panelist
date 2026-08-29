@@ -21,10 +21,10 @@ import time
 
 from replanner.replan import replan
 from replanner.run import build_scenarios
+from scheduler import timegrid
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-NOW_SLOT = 48  # mid Day 2
 DATA = os.environ.get("PANELIST_REPLAN_DATA",
                       os.path.join(ROOT, "data", "primary"))
 
@@ -47,8 +47,13 @@ def main():
     with open(os.path.join(DATA, "schedule.json")) as f:
         prior = json.load(f)["scheduled"]
 
+    # Mid Day 2, from the dataset's own grid rather than a hardcoded 48 —
+    # which silently means something else the moment the day length changes.
+    slots_raw = timegrid.slots_per_day_raw(dataset["config"])
+    now_slot = timegrid.absolute(dataset["config"], 1, slots_raw // 2)
+
     prior_by_id = {a["id"]: a for a in prior}
-    locked = {i for i, a in prior_by_id.items() if a["start"] < NOW_SLOT}
+    locked = {i for i, a in prior_by_id.items() if a["start"] < now_slot}
     scenarios = build_scenarios(prior, dataset)
 
     print(f"{'scenario':<10} {'status':<9} {'elect%':>7} {'forced':>7} "
@@ -60,7 +65,7 @@ def main():
     for name in ("late", "panel", "withdraw", "room", "compound"):
         t0 = time.time()
         p = replan(dataset, prior, scenarios[name], churn_cap_pct=10,
-                   time_limit_seconds=TIME_LIMIT, now_slot=NOW_SLOT)
+                   time_limit_seconds=TIME_LIMIT, now_slot=now_slot)
         if not p["ok"]:
             print(f"{name:<10} FAILED: {p['reason'][:60]}")
             failures.append(name)

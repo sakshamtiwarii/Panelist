@@ -449,6 +449,16 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
   border-radius: var(--r-sm); padding: 7px 9px;
 }
 .alt-n { font-size: 15px; line-height: 1.2; margin-top: 3px; }
+
+/* Per-room utilisation under each room header (guide section 3: "per room and
+   aggregate" — the band above carries the aggregate). */
+.grid-roomhead .util {
+  display: block; height: 2px; margin-top: 3px;
+  background: var(--line); border-radius: 1px; overflow: hidden;
+}
+.grid-roomhead .util > span {
+  display: block; height: 100%; background: var(--ink-3);
+}
 .alt-sub { font-size: 11px; opacity: 0.8; margin-top: 2px; }
 
 .diff-group { border-bottom: 1px solid var(--line); }

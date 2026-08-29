@@ -279,10 +279,6 @@ def _add_company(dataset, spec):
         raise DisruptionError(
             f"interview length must be a multiple of {slot_minutes} minutes")
 
-    eligible = sorted(
-        (s for s in dataset["students"] if s["cgpa"] >= cutoff),
-        key=lambda s: -s["cgpa"],
-    )
     explicit = spec.get("shortlist")
     if explicit:
         missing = [s for s in explicit if s not in students]
@@ -295,6 +291,13 @@ def _add_company(dataset, spec):
                 f"{cutoff} cutoff (e.g. {below[0]})")
         shortlist = list(explicit)
     else:
+        # Ranked by CGPA, which is what a late registration actually asks for:
+        # "we want twenty, cutoff 8.5". Built here rather than above because
+        # an explicit shortlist never consults it.
+        eligible = sorted(
+            (s for s in dataset["students"] if s["cgpa"] >= cutoff),
+            key=lambda s: -s["cgpa"],
+        )
         size = int(spec.get("shortlist_size", 20))
         if size > len(eligible):
             raise DisruptionError(
@@ -727,10 +730,16 @@ def compute_diff(old_schedule, new_schedule, forced_removed=()):
 
     def describe(iid):
         a, b = old.get(iid), new.get(iid)
+        rec = b or a
         entry = {
             "id": iid,
-            "company_id": (b or a)["company_id"],
-            "student_id": (b or a)["student_id"],
+            "company_id": rec["company_id"],
+            "student_id": rec["student_id"],
+            # Enough for the board to draw a NEWLY placed interview. Without
+            # these the dashboard can name an addition but cannot position it,
+            # so a proposal that adds interviews previews as nothing at all.
+            "duration_slots": rec["duration_slots"],
+            "tier": rec["tier"],
         }
         if a:
             entry["from"] = {

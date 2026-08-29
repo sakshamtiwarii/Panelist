@@ -28,6 +28,12 @@ interface Props {
   lockedBefore: number | null;
   focusStudent: string | null;
   onPick: (a: Appointment) => void;
+  /** Narrow the board to one room. Null shows every room. */
+  roomFilter: string | null;
+  /** Dim everything except one company. Null dims nothing. */
+  companyFilter: string | null;
+  /** Per-room utilisation %, keyed by room id (guide section 3). */
+  roomUtilisation?: Record<string, number>;
 }
 
 const ROW_H = 27;
@@ -42,8 +48,12 @@ const MARK: Record<string, string> = { moved: "\u21C5", added: "+", cut: "\u00D7
 export default function ScheduleGrid({
   day, cfg, clock, appointments, companyName,
   changeState, lockedBefore, focusStudent, onPick,
+  roomFilter, companyFilter, roomUtilisation,
 }: Props) {
-  const rooms = cfg.rooms;
+  const rooms = useMemo(
+    () => (roomFilter ? cfg.rooms.filter((r) => r.id === roomFilter) : cfg.rooms),
+    [cfg.rooms, roomFilter],
+  );
   const slots = cfg.config.usable_slots_per_day;
 
   // Row index per slot, since lunch makes slot numbers non-contiguous.
@@ -79,10 +89,22 @@ export default function ScheduleGrid({
     return s;
   }, [rooms, day]);
 
-  const todays = appointments.filter((a) => a.day === day && a.room);
+  const onThisDay = appointments.filter((a) => a.day === day);
+  const todays = onThisDay.filter((a) => a.room);
+  // An interview with no room cannot be placed on a room x time grid, but
+  // dropping it from the view made a real failure invisible: the schedule
+  // showed fine while some interviews had nowhere to happen.
+  const roomless = onThisDay.length - todays.length;
 
   return (
     <div className="grid-scroll">
+      {roomless > 0 && (
+        <div className="callout err" style={{ margin: "0 0 10px" }}>
+          {roomless} interview{roomless === 1 ? "" : "s"} on this day could not
+          be assigned a room, so {roomless === 1 ? "it is" : "they are"} not on
+          the board. This is a hard-constraint failure, not a display limit.
+        </div>
+      )}
       <div
         className="grid"
         style={{
@@ -91,15 +113,25 @@ export default function ScheduleGrid({
         }}
       >
         <div className="grid-corner" />
-        {rooms.map((r) => (
-          <div
-            key={r.id}
-            className={`grid-roomhead${roomBlockedToday.has(r.id) ? " blocked" : ""}`}
-            title={blockedReason(r, day)}
-          >
-            {r.name.replace(/^Room /, "R")}
-          </div>
-        ))}
+        {rooms.map((r) => {
+          const util = roomUtilisation?.[r.id];
+          return (
+            <div
+              key={r.id}
+              className={`grid-roomhead${roomBlockedToday.has(r.id) ? " blocked" : ""}`}
+              title={util === undefined
+                ? blockedReason(r, day)
+                : `${blockedReason(r, day)} — ${util}% used across the week`}
+            >
+              {r.name.replace(/^Room /, "R")}
+              {util !== undefined && (
+                <span className="util" aria-hidden>
+                  <span style={{ width: `${Math.min(100, util)}%` }} />
+                </span>
+              )}
+            </div>
+          );
+        })}
 
         {slots.map((s, row) => (
           <TimeRow
@@ -123,7 +155,9 @@ export default function ScheduleGrid({
           const state = changeState(a.id);
           const locked =
             lockedBefore !== null && clock.abs(a.day, a.slot) < lockedBefore;
-          const dim = focusStudent !== null && a.student_id !== focusStudent;
+          const dim =
+            (focusStudent !== null && a.student_id !== focusStudent) ||
+            (companyFilter !== null && a.company_id !== companyFilter);
 
           return (
             <button

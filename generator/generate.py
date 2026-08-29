@@ -221,8 +221,12 @@ def scale_shortlist_sizes(companies, rooms, days, config, load_factor):
 
 # --- Students --------------------------------------------------------------
 
-def generate_students(rng, n, companies):
-    """Cohort with a right-skewed CGPA distribution (not uniform)."""
+def generate_students(rng, n):
+    """Cohort with a right-skewed CGPA distribution (not uniform).
+
+    Shortlist membership is assigned separately by `assign_shortlists`, so the
+    company list is not needed here.
+    """
     students = []
     for i in range(n):
         cgpa = rng.gauss(7.2, 0.9)
@@ -445,7 +449,7 @@ def build_dataset(seed=42, companies=35, students=800, rooms=20, days=4,
     capacity_slots = scale_shortlist_sizes(
         company_list, rooms, days, config, load_factor
     )
-    student_list = generate_students(rng, students, company_list)
+    student_list = generate_students(rng, students)
     assign_shortlists(rng, student_list, company_list)
     room_list = generate_rooms(rng, rooms, days, config)
 

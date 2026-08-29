@@ -49,6 +49,11 @@ export default function Page() {
   // THIS squeeze" is a decision about a solve, not a standing property.
   const [priority, setPriority] = useState<PriorityOverrides>({});
   const [focusStudent, setFocusStudent] = useState<string | null>(null);
+  // Guide 2.4: the board is filterable by day / room / company. Day is the
+  // tab strip; these two are the rest of it. Room narrows the columns,
+  // company dims the rest so the surroundings stay readable.
+  const [roomFilter, setRoomFilter] = useState<string | null>(null);
+  const [companyFilter, setCompanyFilter] = useState<string | null>(null);
   const [theme, setTheme] = useState<"system" | "light" | "dark">("system");
   // "origin-rejected" means the API answered but refused this page's origin —
   // almost always the wrong port, which otherwise looks like a dead backend.
@@ -234,18 +239,69 @@ export default function Page() {
     if (!d || !proposal?.ok) return appts;
     const cancelled = new Set([...d.removed]);
     const moves = new Map(d.moved_detail.map((m) => [m.id, m.to!]));
-    return appts.map((a) => {
+    const moved = appts.map((a) => {
       if (cancelled.has(a.id)) return a;
       const to = moves.get(a.id);
       return to ? { ...a, day: to.day, slot: to.slot, room: to.room, panel: to.panel } : a;
     });
-  }, [appts, proposal]);
+    // Interviews the proposal ADDS are not in `appts` at all — they do not
+    // exist yet. Without synthesising them the board previewed an addition as
+    // nothing whatsoever, while the legend advertised a colour for it.
+    const added: Appointment[] = d.added_detail
+      .filter((x) => x.to)
+      .map((x) => ({
+        id: x.id,
+        company_id: x.company_id,
+        student_id: x.student_id,
+        duration_slots: x.duration_slots,
+        tier: x.tier,
+        day: x.to!.day,
+        slot: x.to!.slot,
+        start: clock ? clock.abs(x.to!.day, x.to!.slot) : 0,
+        end: clock ? clock.abs(x.to!.day, x.to!.slot) + x.duration_slots : 0,
+        room: x.to!.room,
+        panel: x.to!.panel,
+      }));
+    return [...moved, ...added];
+  }, [appts, proposal, clock]);
 
   const perDayCount = useMemo(() => {
     const counts = new Map<number, number>();
     boardAppts.forEach((a) => counts.set(a.day, (counts.get(a.day) ?? 0) + 1));
     return counts;
   }, [boardAppts]);
+
+  /**
+   * Who a disruption would hurt most on this day, before one happens.
+   *
+   * Two things make a student fragile: a full day (any delay cascades through
+   * all of it) and back-to-back interviews (no slack to absorb an overrun).
+   * Both are read off the board rather than asked of the API, so the view
+   * follows a proposal preview as well as the live schedule.
+   */
+  const atRisk = useMemo(() => {
+    const byStudent = new Map<string, Appointment[]>();
+    boardAppts
+      .filter((a) => a.day === day)
+      .forEach((a) => {
+        const list = byStudent.get(a.student_id) ?? [];
+        list.push(a);
+        byStudent.set(a.student_id, list);
+      });
+
+    const rows = [];
+    for (const [student_id, items] of byStudent) {
+      items.sort((x, y) => x.start - y.start);
+      let tight = 0;
+      for (let i = 1; i < items.length; i++) {
+        if (items[i].start === items[i - 1].end) tight++;
+      }
+      if (items.length >= 3 || tight > 0) {
+        rows.push({ student_id, count: items.length, tight });
+      }
+    }
+    return rows.sort((a, b) => b.tight - a.tight || b.count - a.count);
+  }, [boardAppts, day]);
 
   const describeEvent = useCallback(
     (e: DisruptionEvent) => {
@@ -604,6 +660,38 @@ export default function Page() {
             )}
           </div>
 
+          {atRisk.length > 0 && (
+            <div className="rail-section">
+              <span className="label">
+                At risk on Day {day + 1} ({atRisk.length})
+              </span>
+              <p className="hint" style={{ marginTop: 6, marginBottom: 10 }}>
+                Students with a full day or no gap between interviews. A delay
+                here cascades furthest — these are who to check first.
+              </p>
+              {atRisk.slice(0, 6).map((r) => (
+                <button
+                  className="risk-row"
+                  key={r.student_id}
+                  style={{ width: "100%", textAlign: "left" }}
+                  title={r.tight
+                    ? `${r.tight} back-to-back interview(s) with no gap`
+                    : `${r.count} interviews this day`}
+                  onClick={() =>
+                    setFocusStudent((s) =>
+                      s === r.student_id ? null : r.student_id)
+                  }
+                >
+                  <span>{r.student_id}</span>
+                  <span className="n num">
+                    {r.count}
+                    {r.tight > 0 && ` · ${r.tight} tight`}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+
           {diag && diag.unscheduled > 0 && (
             <div className="rail-section">
               <span className="label">Can&rsquo;t be placed ({diag.unscheduled})</span>
@@ -659,6 +747,34 @@ export default function Page() {
               </button>
             ))}
             <span className="spacer" />
+            <label className="ctl" title="Show a single room's column">
+              Room
+              <select
+                className="select"
+                style={{ width: 116 }}
+                value={roomFilter ?? ""}
+                onChange={(e) => setRoomFilter(e.target.value || null)}
+              >
+                <option value="">All rooms</option>
+                {cfg.rooms.map((r) => (
+                  <option key={r.id} value={r.id}>{r.name}</option>
+                ))}
+              </select>
+            </label>
+            <label className="ctl" title="Highlight one company across the day">
+              Company
+              <select
+                className="select"
+                style={{ width: 132 }}
+                value={companyFilter ?? ""}
+                onChange={(e) => setCompanyFilter(e.target.value || null)}
+              >
+                <option value="">All companies</option>
+                {cfg.companies.map((c) => (
+                  <option key={c.id} value={c.id}>{c.name}</option>
+                ))}
+              </select>
+            </label>
             {error && <span className="banner err">{error}</span>}
             {proposal?.ok && (
               <span className="banner">
@@ -677,6 +793,9 @@ export default function Page() {
               changeState={changeState}
               lockedBefore={nowSlot}
               focusStudent={focusStudent}
+              roomFilter={roomFilter}
+              companyFilter={companyFilter}
+              roomUtilisation={metrics?.room_utilization_per_room}
               onPick={(a) =>
                 setFocusStudent((s) => (s === a.student_id ? null : a.student_id))
               }

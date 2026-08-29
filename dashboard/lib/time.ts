@@ -16,6 +16,8 @@ export function makeClock(cfg: ConfigResponse) {
 
   return {
     label,
+    /** Slots in a day INCLUDING the lunch band — the raw grid width. */
+    raw,
     /** Absolute slot -> "D2 14:15" */
     stamp: (abs: number) => `D${Math.floor(abs / raw) + 1} ${label(abs % raw)}`,
     /** Day + slot-in-day -> absolute slot */

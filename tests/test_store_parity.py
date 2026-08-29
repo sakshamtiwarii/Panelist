@@ -108,6 +108,52 @@ def test_dataset_round_trips(store, dataset_name, sample):
     assert back["config"]["day_start_minutes"] == ds["config"]["day_start_minutes"]
 
 
+def test_disruption_windows_survive_a_dataset_round_trip(store, dataset_name,
+                                                         sample):
+    """A company that arrived late really was unavailable.
+
+    `put_dataset` listed neither JSONB column, and both default to '[]', so a
+    dataset carrying lateness windows or panel blackouts came back without
+    them — while MemoryStore, which keeps the dict it was handed, returned
+    them intact. The schema comment says these exist so "a second replan would
+    [not] silently forget the first"; nothing checked that they were written.
+    """
+    ds, _ = sample
+    amended = {**ds, "companies": [dict(c) for c in ds["companies"]]}
+    amended["companies"][0]["unavailable_windows"] = [(0, 12)]
+    amended["companies"][0]["panel_blackouts"] = [(48, 128)]
+
+    store.put_dataset(dataset_name, amended)
+    back = store.get_dataset(dataset_name)
+    company = next(c for c in back["companies"]
+                   if c["id"] == amended["companies"][0]["id"])
+
+    # Compared as lists of pairs: JSONB round-trips tuples as arrays, and the
+    # model only ever unpacks them as (from, to).
+    assert [tuple(w) for w in company["unavailable_windows"]] == [(0, 12)]
+    assert [tuple(w) for w in company["panel_blackouts"]] == [(48, 128)]
+
+
+def test_current_version_tracks_the_live_schedule(store, dataset_name, sample):
+    """The cheap probe the API's dataset cache is validated against.
+
+    It has to move on every write, or a worker holding a cached roster never
+    learns that another one amended it.
+    """
+    ds, sched = sample
+    assert store.current_version(dataset_name) is None
+    store.put_dataset(dataset_name, ds)
+
+    v1 = store.put_schedule(dataset_name, sched, [], {"status": "OPTIMAL"}, {})
+    assert store.current_version(dataset_name) == v1
+    v2 = store.put_schedule(dataset_name, sched[:5], [], {"status": "OPTIMAL"},
+                            {}, origin="replan")
+    assert store.current_version(dataset_name) == v2 != v1
+    # And it agrees with the full read it exists to avoid.
+    assert store.current_version(dataset_name) == \
+        store.get_current(dataset_name)["version"]
+
+
 def test_current_dataset_finds_the_live_one(store, dataset_name, sample):
     ds, sched = sample
     assert store.current_dataset() is None or True   # may hold other datasets
@@ -129,6 +175,26 @@ def test_proposals_round_trip_and_clear(store, dataset_name):
 def test_expired_proposals_are_invisible(store, dataset_name):
     store.put_proposal("old", dataset_name, {"ok": True}, ttl_minutes=-1)
     assert store.get_proposal("old") is None
+
+
+def test_memory_store_sweeps_expired_proposals_on_clear():
+    """MemoryStore must not hoard proposals for datasets it has moved past.
+
+    Deliberately NOT a parity test, and asserted against the internal dict.
+    PostgresStore has always swept expired rows here ("OR expires_at <= now()")
+    and MemoryStore had not, but the difference is invisible from outside:
+    `get_proposal` deletes an expired row lazily when asked for it, so both
+    stores answer identically and only the retained memory differs. Written
+    through the public interface this test would pass either way and cover
+    nothing, so it looks at the container instead.
+    """
+    s = MemoryStore()
+    s.put_proposal("live", "d1", {"ok": True}, ttl_minutes=30)
+    s.put_proposal("stale", "d2", {"ok": True}, ttl_minutes=-1)
+    s.put_proposal("other", "d2", {"ok": True}, ttl_minutes=30)
+
+    s.clear_proposals("d1")
+    assert set(s._proposals) == {"other"}, "d1's applied, d2's expired one gone"
 
 
 def test_affected_counts_other_interviews_that_day(store, dataset_name, sample):

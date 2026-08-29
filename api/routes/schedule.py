@@ -91,12 +91,14 @@ def create_schedule(req: ScheduleRequest, _=Depends(require_coordinator)):
     metrics = compute_metrics(
         scheduled, unscheduled, ds["students"], ds["rooms"], ds["config"]
     )
-    set_loaded(req.dataset, ds)
     store.put_dataset(req.dataset, ds)
     version = store.put_schedule(
         req.dataset, scheduled, [u["id"] for u in unscheduled],
         report, metrics, origin="solve",
     )
+    # Adopted with the version it belongs to, after the write that created it,
+    # so the cache is trusted rather than re-fetched on the next read.
+    set_loaded(req.dataset, ds, version)
     return {
         "solver": report,
         "metrics": metrics,

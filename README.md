@@ -206,11 +206,21 @@ entirely and everything still runs, in memory.
 
 ```bash
 pip install -e ".[dev]"
-pytest tests/test_api.py              # ~3s, generates its own dataset
-pytest tests/test_store_parity.py     # ~1s, both stores
+pytest                                # ~30s, the whole suite
 python -m tests.test_replan_scenarios # ~3.5min, every disruption type
 ruff check .
 ```
+
+| Suite | Covers |
+|---|---|
+| `test_api.py` | auth, the coordinator/viewer split, propose → apply |
+| `test_store_parity.py` | every case against **both** stores |
+| `test_scheduler_accounting.py` | nothing is dropped from the totals |
+| `test_verification.py` | the independent re-check catches real violations |
+| `test_replan_disruptions.py` | a disruption never dead-ends the coordinator |
+| `test_priority_overrides.py` | the coordinator can overrule the tier default |
+| `test_generator.py` | the generator's input contract |
+| `test_dataset_cache.py` | a cached roster never outlives its dataset |
 
 `tests/test_store_parity.py` runs every case against **both** stores and
 asserts the same outcome. The in-memory fallback exists so the app survives an
@@ -232,9 +242,11 @@ must hold whatever the solver decides: zero student clashes (recomputed
 independently), the model's own hard-constraint verification, and that
 interviews already under way are neither moved nor cancelled.
 
-All of these run in CI (`.github/workflows/ci.yml`), which stands up a Postgres
-service for the parity suite and runs the replan scenarios as their own job
-with a larger solver budget — a CI runner has fewer cores than a dev machine,
+CI (`.github/workflows/ci.yml`) runs `pytest` over the whole suite rather than
+a list of files — naming files makes a new test file opt-in, so a regression
+test can sit in the repo passing locally and never run in CI. It stands up a
+Postgres service for the parity cases and runs the replan scenarios as their
+own job with a larger solver budget — a CI runner has fewer cores than a dev machine,
 so the solver needs more wall-clock for the same result
 (`PANELIST_REPLAN_TIME_LIMIT`).
 
@@ -397,7 +409,9 @@ company, student) · `GET /metrics` · `GET /diagnostics` · `GET /affected` ·
   coordinator/viewer roles gating mutation.
 - **Roster editing** — done. Add/withdraw a company, edit shortlist entries,
   all costed through the replanner rather than written directly.
-- **Dashboard** — done. Next.js coordinator console (see below).
+- **Dashboard** — done. Next.js coordinator console: board filterable by day,
+  room and company, at-risk view, priority overrides, diff preview with
+  apply/reject (see below).
 
 ## Dashboard
 
@@ -415,11 +429,29 @@ does this delay push into — and a grid answers them without the reader
 assembling anything mentally. Blocked room windows are hatched; interviews
 already under way are tinted and pinned.
 
+**Filterable by day, room and company.** Day is the tab strip; room narrows
+the board to one column; company dims everything else so the surroundings stay
+readable. Clicking any interview traces that student across the day.
+
+**At risk on this day.** Students with a full day or with back-to-back
+interviews and no gap — the two things that make a delay cascade furthest.
+Computed from the board being displayed, so it follows a proposal preview as
+well as the live schedule, and answers "who do I check first" before anything
+has gone wrong.
+
+**Per-room utilisation** sits under each room header as a bar, with the exact
+figure in the tooltip; the metrics band above carries the aggregate.
+
 **Proposals preview on the board.** A replan recolours moved and cancelled
 interviews *in place* before anything is committed, so the change is read
 against the real schedule rather than inferred from a list. Cancelled
 interviews stay visible in their old slot so the loss is legible rather than
-a silent absence.
+a silent absence, and newly placed interviews are drawn where they would land.
+
+**Interviews with no room are called out, not hidden.** A room × time grid has
+nowhere to draw an unassignable interview, so the board says how many there
+are rather than quietly omitting them — that is a hard-constraint failure, not
+a display limit.
 
 **Churn is shown against the cap as a bar** before any list of changes,
 because "is this fix proportionate" is the actual question. Forced churn (what

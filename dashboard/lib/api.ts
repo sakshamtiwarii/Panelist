@@ -171,6 +171,8 @@ export interface Metrics {
   pct_scheduled: number;
   student_clashes: number;
   room_utilization_pct: number;
+  /** Per room, keyed by room id — the aggregate above is only half of it. */
+  room_utilization_per_room: Record<string, number>;
   avg_student_wait_minutes: number;
   max_student_wait_minutes: number;
   students_with_interviews: number;
@@ -276,6 +278,9 @@ export interface ChangeDetail {
   id: string;
   company_id: string;
   student_id: string;
+  /** Carried so a newly placed interview can be drawn, not just named. */
+  duration_slots: number;
+  tier: number;
   from?: { day: number; slot: number; room: string | null; panel: number };
   to?: { day: number; slot: number; room: string | null; panel: number };
 }

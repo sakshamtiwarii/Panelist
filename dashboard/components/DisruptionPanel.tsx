@@ -88,7 +88,9 @@ export default function DisruptionPanel({
         break;
       case "room_unavailable":
         Object.assign(base, {
-          room_id: roomId, day, from_slot: 0, to_slot: 32,
+          // The whole day, from the grid the API reported — a literal 32 is
+          // only right while the day happens to be 09:00-17:00 in 15min slots.
+          room_id: roomId, day, from_slot: 0, to_slot: clock.raw,
           reason: "became unavailable",
         });
         break;
