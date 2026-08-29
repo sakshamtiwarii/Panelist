@@ -83,3 +83,30 @@ def clock(config, slot_in_day):
     """
     mins = day_start_minutes(config) + slot_in_day * config["slot_minutes"]
     return f"{mins // 60:02d}:{mins % 60:02d}"
+
+
+def stamp(config, day, slot_in_day):
+    """'Day 2 12:00' — how a coordinator reads a moment.
+
+    Lives here because four modules were each building this string from
+    `clock()` by hand, and a raw slot index is not something anyone can check
+    against a clock on the wall.
+    """
+    return f"Day {day + 1} {clock(config, slot_in_day)}"
+
+
+def stamp_absolute(config, absolute_slot):
+    """`stamp` for an absolute slot."""
+    return stamp(config, *split(config, absolute_slot))
+
+
+def overlaps(a0, a1, b0, b1):
+    """Do the half-open slot ranges [a0, a1) and [b0, b1) intersect?
+
+    The codebase's most-repeated test, and it had been written three different
+    ways — `a < w1 and b > w0`, `not (hi <= b0 or lo >= b1)`, and inline
+    variants. They agree, but only if every inequality is right in every copy,
+    and an interval test that is wrong by one sign fails silently: interviews
+    land in blocked rooms and nothing raises.
+    """
+    return a0 < b1 and a1 > b0

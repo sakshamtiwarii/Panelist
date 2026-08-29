@@ -33,7 +33,7 @@ import copy
 
 from scheduler import timegrid
 from scheduler.metrics import compute_churn
-from scheduler.model import SchedulingModel
+from scheduler.model import SchedulingModel, panels_available
 
 # Churn weight for the first attempt: light enough that the solver will still
 # reshuffle to keep interviews scheduled, heavy enough to prefer stability.
@@ -44,17 +44,6 @@ STABILITY_CHURN_WEIGHT = 40
 
 class DisruptionError(ValueError):
     """Raised when a disruption event does not name a real entity."""
-
-
-def _stamp(config, absolute_slot):
-    """An absolute slot as 'Day 2 12:00'.
-
-    Event descriptions are read by a coordinator deciding whether to accept a
-    fix, and a raw slot index is not something anyone can check against a
-    clock on the wall.
-    """
-    day, slot = timegrid.split(config, absolute_slot)
-    return f"Day {day + 1} {timegrid.clock(config, slot)}"
 
 
 # --- disruption application ------------------------------------------------
@@ -82,7 +71,7 @@ def apply_disruption(dataset, disruption, prior_schedule, now_slot=None):
         company = companies[cid]
         day = disruption.get("day", 0)
         hours = disruption["hours"]
-        slots_late = int(round(hours * 60 / slot_minutes))
+        slots_late = round(hours * 60 / slot_minutes)
         day_start = timegrid.absolute(dataset["config"], day, 0)
         # Blocks only the delayed part of THAT day. A watermark would forbid
         # every earlier day as well and drag unrelated interviews across the
@@ -133,7 +122,7 @@ def apply_disruption(dataset, disruption, prior_schedule, now_slot=None):
         for _ in range(dropped):
             existing.append((from_slot, horizon))
 
-        when = _stamp(dataset["config"], from_slot)
+        when = timegrid.stamp_absolute(dataset["config"], from_slot)
         if dropped < count:
             had = (f"it had only {available} still running"
                    if available else "all of its panels were already out")
@@ -279,10 +268,6 @@ def _add_company(dataset, spec):
         raise DisruptionError(
             f"interview length must be a multiple of {slot_minutes} minutes")
 
-    eligible = sorted(
-        (s for s in dataset["students"] if s["cgpa"] >= cutoff),
-        key=lambda s: -s["cgpa"],
-    )
     explicit = spec.get("shortlist")
     if explicit:
         missing = [s for s in explicit if s not in students]
@@ -295,6 +280,13 @@ def _add_company(dataset, spec):
                 f"{cutoff} cutoff (e.g. {below[0]})")
         shortlist = list(explicit)
     else:
+        # Ranked by CGPA, which is what a late registration actually asks for:
+        # "we want twenty, cutoff 8.5". Built here rather than above because
+        # an explicit shortlist never consults it.
+        eligible = sorted(
+            (s for s in dataset["students"] if s["cgpa"] >= cutoff),
+            key=lambda s: -s["cgpa"],
+        )
         size = int(spec.get("shortlist_size", 20))
         if size > len(eligible):
             raise DisruptionError(
@@ -595,9 +587,6 @@ def _validate_locks(working, prior_schedule, locked):
         company = companies.get(cid)
         if not company:
             continue
-        panels = company["panel_count"]
-        blackouts = company.get("panel_blackouts", [])
-
         # Capacity is checked at each already-run moment rather than against a
         # single week-wide peak, because a blackout removes a panel from one
         # part of the week only. A blackout laid over an hour the company has
@@ -609,30 +598,31 @@ def _validate_locks(working, prior_schedule, locked):
             concurrent = sum(
                 1 for other in items if other["start"] <= at < other["end"]
             )
-            out = sum(1 for w0, w1 in blackouts if w0 <= at < w1)
-            available = max(0, panels - out)
+            available = panels_available(company, at)
             if concurrent > available:
                 shortfall = concurrent - available
                 if worst is None or shortfall > worst[0]:
                     worst = (shortfall, concurrent, available, probe)
         if worst:
             _, concurrent, available, probe = worst
+            when = timegrid.stamp_absolute(working["config"], probe["start"])
             conflicts.append(
                 f"{company['name']} already had {concurrent} interview(s) "
-                f"running at {_stamp(working['config'], probe['start'])}, but "
-                f"the disruption leaves it {available} panel(s) at that "
-                f"moment."
+                f"running at {when}, but the disruption leaves it "
+                f"{available} panel(s) at that moment."
             )
 
         # Company made unavailable during an hour it has already interviewed.
         for w0, w1 in company.get("unavailable_windows", []):
-            clashing = [a for a in items if a["start"] < w1 and a["end"] > w0]
+            clashing = [a for a in items
+                        if timegrid.overlaps(a["start"], a["end"], w0, w1)]
             if clashing:
+                first = timegrid.stamp_absolute(
+                    working["config"], clashing[0]["start"])
                 conflicts.append(
                     f"{company['name']} is marked unavailable over a window "
                     f"in which {len(clashing)} of its interviews have already "
-                    f"taken place (e.g. "
-                    f"{_stamp(working['config'], clashing[0]['start'])})."
+                    f"taken place (e.g. {first})."
                 )
     return conflicts
 
@@ -687,8 +677,7 @@ def _build_proposal(working, prior_scheduled, attempt, applied, churn_cap_pct,
         "schedule": attempt["scheduled"],
         "unscheduled": [u["id"] for u in attempt["unscheduled"]],
         "diff": diff,
-        "notify": compute_notify_list(diff, working, prior_scheduled,
-                                      attempt["scheduled"],
+        "notify": compute_notify_list(diff, working,
                                       extra_names=original_names),
         "verification_errors": errors,
         "churn_cap_pct": churn_cap_pct,
@@ -727,10 +716,16 @@ def compute_diff(old_schedule, new_schedule, forced_removed=()):
 
     def describe(iid):
         a, b = old.get(iid), new.get(iid)
+        rec = b or a
         entry = {
             "id": iid,
-            "company_id": (b or a)["company_id"],
-            "student_id": (b or a)["student_id"],
+            "company_id": rec["company_id"],
+            "student_id": rec["student_id"],
+            # Enough for the board to draw a NEWLY placed interview. Without
+            # these the dashboard can name an addition but cannot position it,
+            # so a proposal that adds interviews previews as nothing at all.
+            "duration_slots": rec["duration_slots"],
+            "tier": rec["tier"],
         }
         if a:
             entry["from"] = {
@@ -772,9 +767,12 @@ def compute_diff(old_schedule, new_schedule, forced_removed=()):
     }
 
 
-def compute_notify_list(diff, dataset, old_schedule, new_schedule,
-                        extra_names=None):
+def compute_notify_list(diff, dataset, extra_names=None):
     """Who needs to be told what — generated straight from the diff.
+
+    Takes only the diff and the roster: it used to also accept the old and new
+    schedules and read neither, which is exactly what "generated straight from
+    the diff" means.
 
     Explicitly requested by the spec and easy to forget (guide section 5,
     item 5). One entry per person, not per changed interview, so a student
@@ -790,8 +788,7 @@ def compute_notify_list(diff, dataset, old_schedule, new_schedule,
         return names.get(cid, cid)
 
     def clock(rec):
-        return (f"Day {rec['day'] + 1} "
-                f"{timegrid.clock(dataset['config'], rec['slot'])}")
+        return timegrid.stamp(dataset["config"], rec["day"], rec["slot"])
 
     per_student = {}
 

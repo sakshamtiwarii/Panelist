@@ -67,9 +67,7 @@ def main():
     for e in errors[:10]:
         print(f"  ! {e}")
 
-    m = compute_metrics(
-        scheduled, unscheduled, ds["students"], ds["rooms"], ds["config"]
-    )
+    m = compute_metrics(scheduled, unscheduled, ds["rooms"], ds["config"])
     print()
     print(format_metrics(m))
 

@@ -92,6 +92,47 @@ def test_schedules_are_versioned_not_mutated(store, dataset_name, sample):
     assert rows[0]["appointments"] == 10 and rows[1]["appointments"] == 84
 
 
+def test_replan_history_has_one_shape(store, dataset_name, sample):
+    """The audit trail must not describe itself differently per store.
+
+    The same rule as `versions` above, and the case that was missing: one store
+    returned `applied_at` and `schedule_id`, the other `to_version` and
+    `disruptions`. Anything rendering a timestamp got blanks whenever the
+    in-memory fallback was serving.
+    """
+    ds, sched = sample
+    store.put_dataset(dataset_name, ds)
+    store.put_schedule(dataset_name, sched, [], {"status": "OPTIMAL"}, {})
+    version = store.put_schedule(dataset_name, sched[:10], [],
+                                 {"status": "OPTIMAL"}, {}, origin="replan")
+
+    proposal = {
+        "diff": {"elective_churn_count": 7, "forced_churn_count": 2,
+                 "elective_churn_pct": 3.5, "added": [], "removed": [],
+                 "moved": [], "forced_removed": [], "elective_removed": [],
+                 "affected_students": [], "affected_companies": []},
+        "disruptions_applied": ["TCS arrives 3h late on Day 1."],
+        "cap_exceeded": False,
+        "notify": {"total_people_to_contact": 9},
+    }
+    store.record_replan(dataset_name, [{"type": "company_late"}], proposal,
+                        version)
+
+    rows = store.replan_history(dataset_name)
+    assert len(rows) == 1
+    assert set(rows[0]) == {"applied_at", "descriptions", "elective_churn",
+                            "forced_churn", "churn_pct", "cap_exceeded",
+                            "notify_count", "schedule_id"}
+    assert rows[0]["elective_churn"] == 7
+    assert rows[0]["forced_churn"] == 2
+    assert rows[0]["notify_count"] == 9
+    assert rows[0]["descriptions"] == ["TCS arrives 3h late on Day 1."]
+    # An ISO timestamp either way, so a client can render it without knowing
+    # which store answered.
+    assert isinstance(rows[0]["applied_at"], str)
+    assert rows[0]["applied_at"][:4].isdigit()
+
+
 def test_dataset_round_trips(store, dataset_name, sample):
     ds, _ = sample
     store.put_dataset(dataset_name, ds)
@@ -108,12 +149,82 @@ def test_dataset_round_trips(store, dataset_name, sample):
     assert back["config"]["day_start_minutes"] == ds["config"]["day_start_minutes"]
 
 
+def test_disruption_windows_survive_a_dataset_round_trip(store, dataset_name,
+                                                         sample):
+    """A company that arrived late really was unavailable.
+
+    `put_dataset` listed neither JSONB column, and both default to '[]', so a
+    dataset carrying lateness windows or panel blackouts came back without
+    them — while MemoryStore, which keeps the dict it was handed, returned
+    them intact. The schema comment says these exist so "a second replan would
+    [not] silently forget the first"; nothing checked that they were written.
+    """
+    ds, _ = sample
+    amended = {**ds, "companies": [dict(c) for c in ds["companies"]]}
+    amended["companies"][0]["unavailable_windows"] = [(0, 12)]
+    amended["companies"][0]["panel_blackouts"] = [(48, 128)]
+
+    store.put_dataset(dataset_name, amended)
+    back = store.get_dataset(dataset_name)
+    company = next(c for c in back["companies"]
+                   if c["id"] == amended["companies"][0]["id"])
+
+    # Compared as lists of pairs: JSONB round-trips tuples as arrays, and the
+    # model only ever unpacks them as (from, to).
+    assert [tuple(w) for w in company["unavailable_windows"]] == [(0, 12)]
+    assert [tuple(w) for w in company["panel_blackouts"]] == [(48, 128)]
+
+
+def test_current_version_tracks_the_live_schedule(store, dataset_name, sample):
+    """The cheap probe the API's dataset cache is validated against.
+
+    It has to move on every write, or a worker holding a cached roster never
+    learns that another one amended it.
+    """
+    ds, sched = sample
+    assert store.current_version(dataset_name) is None
+    store.put_dataset(dataset_name, ds)
+
+    v1 = store.put_schedule(dataset_name, sched, [], {"status": "OPTIMAL"}, {})
+    assert store.current_version(dataset_name) == v1
+    v2 = store.put_schedule(dataset_name, sched[:5], [], {"status": "OPTIMAL"},
+                            {}, origin="replan")
+    assert store.current_version(dataset_name) == v2 != v1
+    # And it agrees with the full read it exists to avoid.
+    assert store.current_version(dataset_name) == \
+        store.get_current(dataset_name)["version"]
+
+
 def test_current_dataset_finds_the_live_one(store, dataset_name, sample):
     ds, sched = sample
     assert store.current_dataset() is None or True   # may hold other datasets
     store.put_dataset(dataset_name, ds)
     store.put_schedule(dataset_name, sched, [], {"status": "OPTIMAL"}, {})
     assert store.current_dataset() is not None
+
+
+def test_current_dataset_is_the_most_recently_solved(store, dataset_name,
+                                                    sample):
+    """With two datasets live at once, the answer must not be arbitrary.
+
+    `is_current` is per dataset, so several can carry one simultaneously — a
+    deployment that seeds a demo week and then has someone solve a different
+    dataset reaches this immediately. Both stores used to pick whichever row
+    came first, which is insertion order in memory and unordered in SQL.
+    """
+    ds, sched = sample
+    other = dataset_name + "b"
+    store.put_dataset(dataset_name, ds)
+    store.put_schedule(dataset_name, sched, [], {"status": "OPTIMAL"}, {})
+    assert store.current_dataset() == dataset_name
+
+    store.put_dataset(other, ds)
+    store.put_schedule(other, sched[:5], [], {"status": "OPTIMAL"}, {})
+    assert store.current_dataset() == other, "the newer solve is the live one"
+
+    # And solving the first one again makes it live once more.
+    store.put_schedule(dataset_name, sched, [], {"status": "OPTIMAL"}, {})
+    assert store.current_dataset() == dataset_name
 
 
 def test_proposals_round_trip_and_clear(store, dataset_name):
@@ -129,6 +240,26 @@ def test_proposals_round_trip_and_clear(store, dataset_name):
 def test_expired_proposals_are_invisible(store, dataset_name):
     store.put_proposal("old", dataset_name, {"ok": True}, ttl_minutes=-1)
     assert store.get_proposal("old") is None
+
+
+def test_memory_store_sweeps_expired_proposals_on_clear():
+    """MemoryStore must not hoard proposals for datasets it has moved past.
+
+    Deliberately NOT a parity test, and asserted against the internal dict.
+    PostgresStore has always swept expired rows here ("OR expires_at <= now()")
+    and MemoryStore had not, but the difference is invisible from outside:
+    `get_proposal` deletes an expired row lazily when asked for it, so both
+    stores answer identically and only the retained memory differs. Written
+    through the public interface this test would pass either way and cover
+    nothing, so it looks at the container instead.
+    """
+    s = MemoryStore()
+    s.put_proposal("live", "d1", {"ok": True}, ttl_minutes=30)
+    s.put_proposal("stale", "d2", {"ok": True}, ttl_minutes=-1)
+    s.put_proposal("other", "d2", {"ok": True}, ttl_minutes=30)
+
+    s.clear_proposals("d1")
+    assert set(s._proposals) == {"other"}, "d1's applied, d2's expired one gone"
 
 
 def test_affected_counts_other_interviews_that_day(store, dataset_name, sample):

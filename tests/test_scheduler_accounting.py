@@ -71,8 +71,8 @@ def test_nothing_is_dropped_from_the_totals(grounded):
 
 def test_metrics_do_not_report_success_on_a_dropped_shortlist(grounded):
     model, scheduled, unscheduled = _solve(grounded)
-    m = compute_metrics(scheduled, unscheduled, grounded["students"],
-                        grounded["rooms"], grounded["config"])
+    m = compute_metrics(scheduled, unscheduled, grounded["rooms"],
+                        grounded["config"])
     grounded_count = len(grounded["companies"][0]["shortlist"])
 
     assert m["interviews_unscheduled"] >= grounded_count

@@ -25,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.auth import current_user, seed_demo_users
 from api.deps import (
+    DATA_ROOT,
     DEFAULT_DATASET,
     current_schedule,
     dataset_is_usable,
@@ -38,6 +39,8 @@ from api.routes import auth as auth_routes
 from api.routes import replan as replan_routes
 from api.routes import roster as roster_routes
 from api.routes import schedule as schedule_routes
+from api.routes.schedule import solve_and_store
+from generator.generate import build_dataset, write_dataset
 from scheduler import timegrid
 
 app = FastAPI(title="Panelist API")
@@ -75,12 +78,16 @@ app.include_router(replan_routes.router)
 
 @app.get("/health")
 def health():
-    cur = current_schedule()
+    # The version alone answers both questions here. Reading the whole current
+    # schedule to learn that one number pulled every appointment out of the
+    # database on a call the dashboard makes on every load.
+    name = dataset_name()
+    version = store.current_version(name) if name else None
     return {
         "status": "ok",
-        "dataset_loaded": dataset_name(),
-        "has_schedule": cur is not None,
-        "schedule_version": cur["version"] if cur else None,
+        "dataset_loaded": name,
+        "has_schedule": version is not None,
+        "schedule_version": version,
         "store": store.kind,
         # False when the stored dataset predates the current time model:
         # a schedule exists but must be re-solved before it can be read.
@@ -167,5 +174,69 @@ def _restore_on_startup():
         print(f"[store] could not restore previous schedule: {e}")
 
 
+# The week a reviewer lands on. Seeded and reproducible, and matching the
+# dataset the README and CI describe, so what they see is what is documented.
+DEMO_DATASET = {
+    "seed": 42, "companies": 35, "students": 800,
+    "rooms": 20, "days": 4, "load_factor": 0.9,
+}
+DEMO_SOLVE_SECONDS = 60
+
+
+def _seed_demo_schedule():
+    """Put a solved week on the board before anyone signs in.
+
+    `data/` is generated, not committed, so a fresh deployment starts with no
+    dataset and no schedule: the reviewer's first screen is an empty board and
+    a Build button, and the first thing the app asks of them is a chore. This
+    generates the documented dataset and solves it on first boot instead —
+    roughly two seconds, because the instance is seeded and solves to OPTIMAL.
+
+    Skipped entirely once a schedule exists, so a restart adopts the real one
+    (see `_restore_on_startup`) rather than overwriting it, and disabled with
+    PANELIST_DEMO_SEED=0 for a deployment that carries its own data.
+    """
+    if os.environ.get("PANELIST_DEMO_SEED", "1") != "1":
+        return
+    if current_schedule() is not None:
+        return
+    try:
+        path = os.path.join(DATA_ROOT, DEFAULT_DATASET, "dataset.json")
+        if os.path.exists(path):
+            ds = read_dataset_file(DEFAULT_DATASET)
+            print(f"[seed] using the dataset already on disk at {path}")
+        else:
+            ds, report = build_dataset(**DEMO_DATASET)
+            print(f"[seed] generated {DEFAULT_DATASET!r} "
+                  f"({DEMO_DATASET['companies']} companies, "
+                  f"{DEMO_DATASET['students']} students)")
+            # Written out so the CLIs and the replan scenario suite work
+            # against the same week the console is showing. Best-effort: a
+            # serverless filesystem is read-only outside /tmp, and the
+            # schedule lives in the database regardless — losing the file
+            # costs the CLIs a regeneration, not the deployment its data.
+            try:
+                write_dataset(
+                    os.path.join(DATA_ROOT, DEFAULT_DATASET), ds, report)
+            except OSError as e:
+                print(f"[seed] not writing {DEFAULT_DATASET!r} to disk "
+                      f"({e.strerror or e}); the schedule is in the store")
+
+        out = solve_and_store(DEFAULT_DATASET, ds, DEMO_SOLVE_SECONDS)
+        if not out["usable"]:
+            print(f"[seed] solver returned {out['report']['status']}; "
+                  f"the console will open on an empty board")
+            return
+        m = out["metrics"]
+        print(f"[seed] solved v{out['version']}: {m['interviews_scheduled']}"
+              f"/{m['interviews_total']} interviews placed "
+              f"({m['pct_scheduled']}%), {m['student_clashes']} clashes — "
+              f"the console opens ready to use")
+    except Exception as e:
+        # A demo convenience must never be why the API fails to start.
+        print(f"[seed] could not prepare a demo schedule: {e}")
+
+
 _seed_accounts()
 _restore_on_startup()
+_seed_demo_schedule()

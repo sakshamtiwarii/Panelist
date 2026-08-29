@@ -214,15 +214,19 @@ def scale_shortlist_sizes(companies, rooms, days, config, load_factor):
         scale = (load_factor * capacity_slots) / demand_slots
 
     for c in companies:
-        c["shortlist_size"] = max(5, int(round(c["_raw_size"] * scale)))
+        c["shortlist_size"] = max(5, round(c["_raw_size"] * scale))
         del c["_raw_size"]
     return capacity_slots
 
 
 # --- Students --------------------------------------------------------------
 
-def generate_students(rng, n, companies):
-    """Cohort with a right-skewed CGPA distribution (not uniform)."""
+def generate_students(rng, n):
+    """Cohort with a right-skewed CGPA distribution (not uniform).
+
+    Shortlist membership is assigned separately by `assign_shortlists`, so the
+    company list is not needed here.
+    """
     students = []
     for i in range(n):
         cgpa = rng.gauss(7.2, 0.9)
@@ -445,7 +449,7 @@ def build_dataset(seed=42, companies=35, students=800, rooms=20, days=4,
     capacity_slots = scale_shortlist_sizes(
         company_list, rooms, days, config, load_factor
     )
-    student_list = generate_students(rng, students, company_list)
+    student_list = generate_students(rng, students)
     assign_shortlists(rng, student_list, company_list)
     room_list = generate_rooms(rng, rooms, days, config)
 
@@ -470,11 +474,13 @@ def build_dataset(seed=42, companies=35, students=800, rooms=20, days=4,
 
 
 def write_dataset(out, dataset, report):
-    """Write the dataset and its density report to `out/`."""
+    """Write the dataset and its density report to `out/`.
+
+    `dataset.json` alone — it already contains the companies, students and
+    rooms. This used to also emit those three as separate files, which nothing
+    in the project ever read back.
+    """
     os.makedirs(out, exist_ok=True)
-    for name in ("companies", "students", "rooms"):
-        with open(os.path.join(out, f"{name}.json"), "w") as f:
-            json.dump(dataset[name], f, indent=2)
     with open(os.path.join(out, "dataset.json"), "w") as f:
         json.dump(dataset, f, indent=2)
     with open(os.path.join(out, "density_report.txt"), "w") as f:

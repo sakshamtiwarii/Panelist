@@ -36,6 +36,9 @@ def client(tmp_path_factory):
     # Both variables are read at import time, so they must be set first.
     os.environ.pop("DATABASE_URL", None)
     os.environ["PANELIST_DATA"] = str(data_root)
+    # No first-boot demo seed: this suite's whole point is a fixed, known
+    # input, and seeding would put a second (larger) dataset alongside it.
+    os.environ["PANELIST_DEMO_SEED"] = "0"
     from api.main import app
     return TestClient(app)
 
@@ -231,7 +234,7 @@ def test_applying_a_missing_alternative_is_refused_clearly(coordinator, solved):
     }).json()
     if not proposed["ok"]:
         pytest.skip("disruption infeasible on this dataset")
-    if proposed["has_alternative"]:
+    if proposed["alternative"]:
         pytest.skip("this proposal does have an alternative")
 
     r = coordinator.post("/replan/apply", json={
@@ -252,7 +255,7 @@ def test_a_proposal_reports_what_it_leaves_unplaced(coordinator, solved):
         pytest.skip("disruption infeasible on this dataset")
     assert isinstance(proposed["unscheduled"], int)
     # And when an alternative is offered, both sides of the choice are costed.
-    if proposed["has_alternative"]:
+    if proposed["alternative"]:
         alt = proposed["alternative"]
         assert {"elective_churn_count", "unscheduled"} <= set(alt)
         assert alt["elective_churn_count"] < proposed["diff"]["elective_churn_count"]
@@ -289,6 +292,63 @@ def test_an_unknown_priority_level_is_refused(coordinator, solved):
         "priority_overrides": {"C001": "vip"},
     })
     assert r.status_code == 422
+
+
+def test_health_reports_the_version_without_loading_the_schedule(client, solved):
+    """/health is called on every dashboard load; it needs one row, not a week.
+
+    It read the entire current schedule to report a boolean and a version
+    number, pulling every appointment out of the database to do it.
+    """
+    from api.deps import store
+
+    calls = {"get_current": 0}
+    original = store.get_current
+
+    def counted(dataset):
+        calls["get_current"] += 1
+        return original(dataset)
+
+    store.get_current = counted
+    try:
+        body = client.get("/health").json()
+    finally:
+        store.get_current = original
+
+    assert body["has_schedule"] is True
+    assert isinstance(body["schedule_version"], int)
+    assert calls["get_current"] == 0, "the version alone answers this"
+
+
+def test_metrics_report_utilisation_per_room_and_aggregate(coordinator, solved):
+    """Guide section 3 asks for both; only the aggregate was ever rendered."""
+    m = coordinator.get("/metrics").json()
+    cfg = coordinator.get("/config").json()
+    per_room = m["room_utilization_per_room"]
+    assert set(per_room) == {r["id"] for r in cfg["rooms"]}
+    assert all(0 <= v <= 100 for v in per_room.values())
+
+
+def test_added_interviews_carry_enough_to_be_drawn(coordinator, solved):
+    """A proposal that adds interviews must be previewable, not just listed.
+
+    The board positions an appointment from its duration and tier; without
+    them an addition could be named in the diff but not shown on the grid,
+    so it previewed as nothing at all.
+    """
+    proposed = coordinator.post("/replan", json={
+        "disruptions": [{
+            "type": "company_add", "name": "Newcomer Ltd", "cgpa_cutoff": 7.0,
+            "shortlist_size": 4, "panel_count": 1, "interview_minutes": 30,
+        }],
+        "time_limit_seconds": 20,
+    }).json()
+    if not proposed["ok"] or not proposed["diff"]["added_detail"]:
+        pytest.skip("no interviews were added on this dataset")
+
+    for item in proposed["diff"]["added_detail"]:
+        assert {"duration_slots", "tier", "to"} <= set(item)
+        assert item["duration_slots"] > 0
 
 
 def test_metrics_and_diagnostics_agree_on_the_shortfall(coordinator, solved):

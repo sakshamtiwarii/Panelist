@@ -38,6 +38,7 @@ reason (see `diagnose_unscheduled`). That is a more specific and more useful
 diagnostic than a solver-level infeasibility certificate.
 """
 
+import os
 from collections import defaultdict
 
 from ortools.sat.python import cp_model
@@ -61,6 +62,28 @@ from scheduler import timegrid
 PRIORITY_LEVELS = ("protect", "normal", "deprioritise")
 PROTECT_BONUS = 100
 DEPRIORITISED_WEIGHT = 1
+
+
+def default_workers():
+    """How many search workers to give CP-SAT."""
+    override = os.environ.get("PANELIST_SOLVER_WORKERS")
+    if override and override.isdigit() and int(override) > 0:
+        return int(override)
+    return max(1, min(8, os.cpu_count() or 1))
+
+
+def panels_available(company, at):
+    """Panels a company still has running at one instant.
+
+    A blackout removes a panel from part of the week rather than lowering the
+    count for all of it, so "how many panels" is a question about a moment.
+    Shared with the replanner's lock validation, which asks exactly the same
+    question of an already-run schedule — the arithmetic was duplicated, and
+    the two copies have to agree or a replan is validated against different
+    capacity than it is verified against.
+    """
+    out = sum(1 for w0, w1 in company.get("panel_blackouts", []) if w0 <= at < w1)
+    return max(0, company["panel_count"] - out)
 
 
 class SchedulingModel:
@@ -185,7 +208,8 @@ class SchedulingModel:
         dur = interview["duration_slots"]
         return [
             s for s in starts
-            if not any(s < w1 and s + dur > w0 for w0, w1 in windows)
+            if not any(timegrid.overlaps(s, s + dur, w0, w1)
+                       for w0, w1 in windows)
         ]
 
     # -- model construction -------------------------------------------------
@@ -386,11 +410,10 @@ class SchedulingModel:
         instance schedules everything, an oversubscribed one returns the best
         partial schedule plus an attributed shortfall.
         """
-        terms = []
-        for iv in self.interviews:
-            terms.append(
-                self.interview_weight(iv) * self.present[iv["id"]]
-            )
+        terms = [
+            self.interview_weight(iv) * self.present[iv["id"]]
+            for iv in self.interviews
+        ]
 
         for cid, level in sorted(self.priority_overrides.items()):
             company = self.company_by_id.get(cid)
@@ -466,10 +489,18 @@ class SchedulingModel:
 
     # -- solving ------------------------------------------------------------
 
-    def solve(self, time_limit_seconds=30, workers=8):
+    def solve(self, time_limit_seconds=30, workers=None):
+        """Solve, with the worker count matched to the machine.
+
+        A hardcoded 8 is wrong in both directions: on a one-vCPU serverless
+        instance it oversubscribes a single core, and on a bigger host it
+        leaves cores idle. PANELIST_SOLVER_WORKERS overrides for a container
+        whose CPU quota is smaller than the host's core count — `os.cpu_count`
+        reports the machine, not the cgroup limit.
+        """
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = time_limit_seconds
-        solver.parameters.num_search_workers = workers
+        solver.parameters.num_search_workers = workers or default_workers()
         status = solver.Solve(self.model)
         return status, solver
 
@@ -547,7 +578,7 @@ class SchedulingModel:
         by_company = defaultdict(list)
         for a in scheduled:
             by_company[a["company_id"]].append(a)
-        for _cid, items in by_company.items():
+        for items in by_company.values():
             free_at = []  # panel index -> slot it frees up
             for a in sorted(items, key=lambda x: x["start"]):
                 # Same stability preference as rooms: keep the prior panel
@@ -594,11 +625,17 @@ class SchedulingModel:
             return
         self._exact_rooms(scheduled)
 
+    def _room_free(self, blocked, rid, lo, hi):
+        """Is room `rid` clear of a blocking window over [lo, hi)?
+
+        A method rather than a closure defined identically in both the greedy
+        and the exact assignment: the two must agree about what "blocked"
+        means, and two copies of the predicate is how they stop agreeing.
+        """
+        return not any(timegrid.overlaps(lo, hi, b0, b1) for b0, b1 in blocked[rid])
+
     def _greedy_rooms(self, scheduled):
         blocked = self._blocked_windows()
-
-        def is_blocked(rid, lo, hi):
-            return any(not (hi <= b0 or lo >= b1) for b0, b1 in blocked[rid])
 
         free_at = {r["id"]: 0 for r in self.rooms}
         ok = True
@@ -614,8 +651,8 @@ class SchedulingModel:
                 candidates.insert(0, prior)
 
             for rid in candidates:
-                if free_at[rid] <= a["start"] and not is_blocked(
-                    rid, a["start"], a["end"]
+                if free_at[rid] <= a["start"] and self._room_free(
+                    blocked, rid, a["start"], a["end"]
                 ):
                     free_at[rid] = a["end"]
                     a["room"] = rid
@@ -632,15 +669,12 @@ class SchedulingModel:
         blocked = self._blocked_windows()
         room_ids = [r["id"] for r in self.rooms]
 
-        def is_blocked(rid, lo, hi):
-            return any(not (hi <= b0 or lo >= b1) for b0, b1 in blocked[rid])
-
         m = cp_model.CpModel()
         var = {}
         for a in scheduled:
             allowed = [
                 i for i, rid in enumerate(room_ids)
-                if not is_blocked(rid, a["start"], a["end"])
+                if self._room_free(blocked, rid, a["start"], a["end"])
             ]
             var[a["id"]] = m.NewIntVarFromDomain(
                 cp_model.Domain.FromValues(allowed), f"room_{a['id']}"
@@ -786,8 +820,8 @@ class SchedulingModel:
         d1, s1 = timegrid.split(self.config, w1)
         if s1 == 0 and d1 > d0:
             d1, s1 = d1 - 1, self.slots_raw
-        start = f"Day {d0 + 1} {timegrid.clock(self.config, s0)}"
-        end = f"Day {d1 + 1} {timegrid.clock(self.config, s1)}"
+        start = timegrid.stamp(self.config, d0, s0)
+        end = timegrid.stamp(self.config, d1, s1)
         return start if start == end else f"{start}\u2009\u2013\u2009{end}"
 
     def diagnose_unscheduled(self, scheduled, unscheduled):
@@ -850,7 +884,6 @@ class SchedulingModel:
                 elif any(t in student_busy[iv["student_id"]] for t in window):
                     student_blocked += 1
 
-            total = len(starts)
             entry = findings[cid]
             entry["count"] += 1
             if panel_blocked >= max(room_blocked, student_blocked):
@@ -861,10 +894,6 @@ class SchedulingModel:
                 entry["causes"]["student_conflict"] += 1
             if len(entry["students"]) < 3:
                 entry["students"].append(iv["student_id"])
-            entry["_saturation"] = round(
-                100.0 * max(panel_blocked, room_blocked, student_blocked)
-                / max(1, total)
-            )
 
         # Per-company panel ceiling — an exact, checkable bound.
         report = []
@@ -992,4 +1021,50 @@ class SchedulingModel:
                     f"{a['id']}: cgpa {student['cgpa']} below cutoff "
                     f"{company['cgpa_cutoff']}"
                 )
+
+        # Availability windows. Overlap and cutoffs were checked above; a room
+        # that is free by time can still be unavailable, and a company can be
+        # absent from an hour it has capacity in. Both enter the model as
+        # constraints and both are re-derived by the greedy colouring, which is
+        # exactly the code this method exists not to trust.
+        blocked = self._blocked_windows()
+        for a in scheduled:
+            rid = a.get("room")
+            if rid is not None:
+                for b0, b1 in blocked[rid]:
+                    if timegrid.overlaps(a["start"], a["end"], b0, b1):
+                        errors.append(
+                            f"{a['id']}: room {rid} is blocked over "
+                            f"{self._window_label(b0, b1)}"
+                        )
+            company = self.company_by_id[a["company_id"]]
+            for w0, w1 in company.get("unavailable_windows", []):
+                if timegrid.overlaps(a["start"], a["end"], w0, w1):
+                    errors.append(
+                        f"{a['id']}: {company['name']} is unavailable over "
+                        f"{self._window_label(w0, w1)}"
+                    )
+
+        # Panel capacity against mid-week blackouts. `_assign_panels` colours
+        # by index without knowing a panel walked out, so the index alone
+        # cannot show this: what matters is that the number running at once
+        # never exceeds the number still standing.
+        by_company = defaultdict(list)
+        for a in scheduled:
+            by_company[a["company_id"]].append(a)
+        for cid, items in by_company.items():
+            company = self.company_by_id[cid]
+            if not company.get("panel_blackouts"):
+                continue
+            for probe in items:
+                at = probe["start"]
+                concurrent = sum(1 for o in items if o["start"] <= at < o["end"])
+                available = panels_available(company, at)
+                if concurrent > available:
+                    errors.append(
+                        f"{company['name']}: {concurrent} interview(s) "
+                        f"running at {self._window_label(at, at)} with only "
+                        f"{available} panel(s) still standing"
+                    )
+                    break
         return errors

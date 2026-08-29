@@ -75,7 +75,8 @@ def propose(events, churn_cap_pct, time_limit_seconds, now_slot=None,
         # trade-off against churn, and the number the alternative usually
         # pays in exchange for moving less.
         "unscheduled": len(proposal["unscheduled"]),
-        "has_alternative": "alternative" in proposal,
+        # The summary's presence is the flag; a separate boolean alongside it
+        # was two ways to say the same thing, and only one was ever read.
         "alternative": _summarise_alternative(proposal.get("alternative")),
         "priority_overrides": overrides,
     }
@@ -158,12 +159,15 @@ def commit_replan(req: ApplyRequest, _=Depends(require_coordinator)):
 
     metrics = compute_metrics(
         schedule, [{"id": i} for i in proposal["unscheduled"]],
-        ds["students"], ds["rooms"], ds["config"],
+        ds["rooms"], ds["config"],
     )
     version = store.put_schedule(
         name, schedule, proposal["unscheduled"],
         proposal.get("solver"), metrics, origin="replan",
     )
+    # Re-stamp with the version the amended roster now belongs to: it was
+    # adopted above before this version existed.
+    set_loaded(name, ds, version)
     store.record_replan(name, proposal.get("_events", []), proposal, version)
 
     # Every other proposal was computed against a schedule that no longer

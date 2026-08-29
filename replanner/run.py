@@ -29,7 +29,9 @@ def build_scenarios(schedule, dataset):
     """
     config = dataset["config"]
     slots_raw = timegrid.slots_per_day_raw(config)
-    lateness_slots = 12  # 3 hours at 15-minute slots
+    # 3 hours, in whatever slot size this dataset uses — 12 is only correct
+    # while slots happen to be 15 minutes.
+    lateness_slots = round(3 * 60 / config["slot_minutes"])
 
     # Late arrival: the (company, day) with the most interviews that would be
     # displaced by a 3h delay.
@@ -39,7 +41,7 @@ def build_scenarios(schedule, dataset):
             displaced[(a["company_id"], a["day"])] = displaced.get(
                 (a["company_id"], a["day"]), 0
             ) + 1
-    (late_company, late_day), late_hits = max(
+    (late_company, late_day), _hits = max(
         displaced.items(), key=lambda kv: kv[1]
     ) if displaced else ((schedule[0]["company_id"], 0), 0)
 
@@ -69,7 +71,7 @@ def build_scenarios(schedule, dataset):
     busy_students = sorted(
         per_student_day.items(), key=lambda kv: -len(kv[1])
     )
-    (victim, victim_day), victim_items = busy_students[0]
+    (victim, _victim_day), victim_items = busy_students[0]
 
     def withdraw_event(items):
         """Withdraw from the second interview on, so there is a real 'rest of
@@ -84,7 +86,9 @@ def build_scenarios(schedule, dataset):
         }],
         "panel": [{
             "type": "panel_drop", "company_id": panel_company, "count": 1,
-            "from_slot": 48,  # mid Day 2 — a panel walking out, not absent
+            # Mid Day 2 — a panel walking out, not one that never arrived.
+            # Derived from the grid, never a hardcoded 48: see timegrid.
+            "from_slot": timegrid.absolute(config, 1, slots_raw // 2),
         }],
         "withdraw": [{
             "type": "student_withdraw", "student_id": victim,
@@ -123,7 +127,7 @@ def parse_args():
     return p.parse_args()
 
 
-def print_proposal(p, dataset, indent="  "):
+def print_proposal(p, indent="  "):
     d = p["diff"]
     print(f"{indent}solver: {p['solver']['status']} "
           f"({p['solver']['wall_time_seconds']}s), "
@@ -201,12 +205,12 @@ def main():
         return 1
 
     print(f"\n-- {proposal['label']} " + "-" * (60 - len(proposal['label'])))
-    print_proposal(proposal, dataset)
+    print_proposal(proposal)
 
     m = compute_metrics(
         proposal["schedule"],
         [{"id": i} for i in proposal["unscheduled"]],
-        dataset["students"], dataset["rooms"], dataset["config"],
+        dataset["rooms"], dataset["config"],
     )
     print()
     print(format_metrics(m))
@@ -216,7 +220,7 @@ def main():
         alt = proposal.get("alternative")
         if alt:
             print(f"\n-- {alt['label']} " + "-" * (60 - len(alt['label'])))
-            print_proposal(alt, dataset)
+            print_proposal(alt)
         elif proposal.get("churn_irreducible"):
             pass  # already explained in the authorization prompt
         else:
