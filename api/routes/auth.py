@@ -1,4 +1,4 @@
-"""Panelist — sign in, sign out, and who am I."""
+"""Sign in, sign out, and who am I."""
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 

@@ -1,18 +1,13 @@
-"""
-Panelist — every interview is accounted for.
+"""Every interview is accounted for.
 
 An interview whose company has no remaining availability never enters the CP
-model: there is no start slot to give it. It was then dropped from the model's
-interview list and never reappeared, so `extract_schedule` returned it as
-neither scheduled nor unscheduled and it vanished from every total.
+model, so it can only be reported by `extract_schedule` if it is carried
+separately — otherwise it is neither scheduled nor unscheduled and drops out of
+every total, leaving `pct_scheduled` reading 100% for a week that lost a whole
+shortlist.
 
-That is the failure mode this project is most exposed to. Nothing crashed;
-`pct_scheduled` simply read 100% for a week that had silently dropped a
-company's entire shortlist, and the diagnostics blamed the cohort's calendars
-for the absence. A wrong answer delivered confidently is worse than an error.
-
-These tests assert the accounting identity directly — scheduled + unscheduled
-covers the demand, whatever the solver decided — and that the shortfall is
+These tests assert the accounting identity directly (scheduled + unscheduled
+covers the demand, whatever the solver decided) and that the shortfall is
 attributed to the company's availability rather than to contention.
 """
 

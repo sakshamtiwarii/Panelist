@@ -1,5 +1,4 @@
-"""
-Panelist — dataset generation, solving, and reading the resulting board.
+"""Dataset generation, solving, and reading the resulting board.
 
 Thin over the solver: these endpoints load state, call `scheduler/`, and shape
 the response. No scheduling logic lives here.
@@ -38,8 +37,7 @@ def generate(req: GenerateRequest, _=Depends(require_coordinator)):
         )
         write_dataset(out, dataset, report)
     except ValueError as e:
-        # The settings are wrong, not the server: a 500 here sends the caller
-        # looking for a fault that is in their own request body.
+        # The settings are wrong, not the server.
         raise HTTPException(400, f"invalid generator settings: {e}")
     except OSError as e:
         raise HTTPException(500, f"could not write dataset to {out}: {e}")
@@ -53,8 +51,7 @@ def check_overrides(overrides, companies):
     """Refuse an override that names a company the dataset does not have.
 
     Dropping it silently would leave the coordinator believing they had
-    protected a company while the solver went on applying the tier default —
-    the exact "silently deprioritize a company" the guide rules out.
+    protected a company while the solver applied the tier default.
     """
     known = {c["id"] for c in companies}
     unknown = sorted(set(overrides) - known)
@@ -73,13 +70,12 @@ def check_overrides(overrides, companies):
 def solve_and_store(name, ds, time_limit_seconds, priority_overrides=None):
     """Solve a dataset and adopt the result as the live schedule.
 
-    Shared by POST /schedule and the first-boot demo seed. Both have to persist
-    the same things in the same order — the dataset before the schedule, the
-    cache stamped with the version the write produced — and two copies of that
-    sequence is how a seeded deployment ends up subtly unlike a solved one.
+    Shared by POST /schedule and the first-boot demo seed, so both persist the
+    same things in the same order: the dataset before the schedule, the cache
+    stamped with the version the write produced.
 
-    Returns a dict; `usable` is False when the solver found nothing, leaving
-    the caller to decide whether that is a 422 or a logged warning.
+    `usable` is False when the solver found nothing, leaving the caller to
+    decide whether that is a 422 or a logged warning.
     """
     model = SchedulingModel(
         ds["companies"], ds["students"], ds["rooms"], ds["config"],
@@ -98,8 +94,8 @@ def solve_and_store(name, ds, time_limit_seconds, priority_overrides=None):
         name, scheduled, [u["id"] for u in unscheduled],
         report, metrics, origin="solve",
     )
-    # Adopted with the version it belongs to, after the write that created it,
-    # so the cache is trusted rather than re-fetched on the next read.
+    # Stamped with the version it belongs to, so the next read trusts the
+    # cache rather than re-fetching.
     set_loaded(name, ds, version)
     return {
         "usable": True, "report": report, "model": model, "metrics": metrics,
@@ -130,7 +126,7 @@ def create_schedule(req: ScheduleRequest, _=Depends(require_coordinator)):
         "version": version,
         "store": store.kind,
         # Echoed back so the coordinator can see which exceptions were in
-        # force for this solve rather than inferring it from the board.
+        # force for this solve.
         "priority_overrides": overrides,
         "priority_reasons": {
             cid: model.constraint_reasons[f"priority_override:{cid}"]
@@ -190,13 +186,7 @@ def diagnostics(_=Depends(current_user)):
 @router.get("/affected")
 def affected(company_id: Optional[str] = None, room: Optional[str] = None,
              day: Optional[int] = None, _=Depends(current_user)):
-    """Who a disruption would touch — the query the database exists for.
-
-    Answers "which students does this hit, and what ELSE do they have that
-    day", which is the question a coordinator asks before deciding whether a
-    fix is acceptable. The second figure is a correlated count over the same
-    student's other interviews: a join, not a lookup.
-    """
+    """Which students a disruption hits, and what else they have that day."""
     require_schedule()
     rows = store.affected(require_dataset(), company_id=company_id,
                           room=room, day=day)
@@ -214,7 +204,6 @@ def schedule_versions(_=Depends(current_user)):
     """Every schedule version for this dataset, newest first.
 
     Replans write a new version rather than mutating, so the plan that existed
-    before a disruption is still queryable — and rollback is a data question
-    rather than a re-solve.
+    before a disruption stays queryable.
     """
     return {"versions": store.versions(require_dataset())}

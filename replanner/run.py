@@ -1,5 +1,4 @@
-"""
-Panelist — replanner CLI.
+"""Replanner CLI.
 
     python -m replanner.run --data ./data/primary --scenario late
     python -m replanner.run --data ./data/primary --scenario compound
@@ -21,16 +20,12 @@ from scheduler.metrics import compute_metrics, format_metrics
 def build_scenarios(schedule, dataset):
     """Scenarios derived from the actual schedule, so they always bite.
 
-    Picking "the busiest company" and then making it late on Day 1 is not
-    enough — the busiest company may have nothing scheduled that morning, and
-    the replan comes back with zero churn, which looks like a working
-    minimal-churn replan but is really a no-op. Each scenario below targets
-    the (entity, day) pair that the current schedule actually loads.
+    Each targets the (entity, day) pair the current schedule actually loads —
+    making the busiest company late on a morning it has nothing scheduled in
+    produces a zero-churn no-op that looks like a successful replan.
     """
     config = dataset["config"]
     slots_raw = timegrid.slots_per_day_raw(config)
-    # 3 hours, in whatever slot size this dataset uses — 12 is only correct
-    # while slots happen to be 15 minutes.
     lateness_slots = round(3 * 60 / config["slot_minutes"])
 
     # Late arrival: the (company, day) with the most interviews that would be
@@ -64,7 +59,7 @@ def build_scenarios(schedule, dataset):
     (busy_room, busy_day), _ = max(room_load.items(), key=lambda kv: kv[1])
 
     # Withdrawals: students with the most interviews still ahead of them on a
-    # single day — the mid-day-offer case from guide section 11.
+    # single day — the mid-day-offer case.
     per_student_day = {}
     for a in schedule:
         per_student_day.setdefault((a["student_id"], a["day"]), []).append(a)
@@ -87,7 +82,6 @@ def build_scenarios(schedule, dataset):
         "panel": [{
             "type": "panel_drop", "company_id": panel_company, "count": 1,
             # Mid Day 2 — a panel walking out, not one that never arrived.
-            # Derived from the grid, never a hardcoded 48: see timegrid.
             "from_slot": timegrid.absolute(config, 1, slots_raw // 2),
         }],
         "withdraw": [{
@@ -99,7 +93,7 @@ def build_scenarios(schedule, dataset):
             "day": busy_day, "from_slot": 0, "to_slot": slots_raw,
             "reason": "burst pipe",
         }],
-        # Guide section 11: their own injection stacks three kinds at once.
+        # Three kinds of disruption stacked at once.
         "compound": [
             {"type": "company_late", "company_id": late_company,
              "day": late_day, "hours": 3},

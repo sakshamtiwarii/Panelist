@@ -37,9 +37,8 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      # The package install is itself the test that the layout is sound: it is
-      # what replaced four sys.path.insert() calls, so a regression there fails
-      # here rather than at runtime in a container.
+      # The install is itself a check that the package layout is sound, so a
+      # regression there fails here rather than at runtime in a container.
       - name: Install
         run: pip install -e ".[dev]" ruff
 
@@ -54,24 +53,15 @@ jobs:
       - name: Solve it
         run: python -m scheduler.run --data ./data/small --time-limit 20
 
-      # The whole suite, not a list of files. Naming files here meant a new
-      # test file was opt-in: every regression test added after this step was
-      # written ran locally and never in CI, so the bug it guarded could come
-      # back with the build still green. `testpaths` in pyproject.toml scopes
-      # this to tests/.
-      #
-      # Covers the API contract, both stores (the parity cases run against
-      # Postgres because PANELIST_TEST_DATABASE_URL is set above; without it
-      # only the memory half would run), the solver's accounting and
-      # verification, disruption handling, the generator's input contract,
-      # priority overrides, and the API's dataset cache.
+      # The whole suite rather than a list of files, so a new test file is
+      # never opt-in; `testpaths` in pyproject.toml scopes it to tests/. The
+      # parity cases reach Postgres because PANELIST_TEST_DATABASE_URL is set
+      # above — without it only the memory half would run.
       - name: Tests
         run: pytest -q
 
-  # The replanner is the core of the project, so it gets checked in CI rather
-  # than only on a developer's machine. It runs as its own job because it is
-  # solver-bound and slow (five scenarios against the full 1013-interview
-  # instance), and there is no reason to make the fast checks wait for it.
+  # Its own job because it is solver-bound and slow (five scenarios against the
+  # full 1013-interview instance), and the fast checks should not wait for it.
   replan:
     name: Replan scenarios — correctness under disruption
     runs-on: ubuntu-latest

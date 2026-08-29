@@ -1,32 +1,20 @@
-"""
-Panelist — authentication.
+"""Authentication: password hashing, signed sessions, and the two role gates.
 
-A replan changes hundreds of people's days, so the console cannot be an open
-endpoint. Two roles:
+    coordinator  full access — solve, replan, and apply a replan
+    viewer       read-only — board, metrics, diagnostics, and may ask for a
+                 proposal, but cannot commit one
 
-    coordinator  full access — solve, replan, and APPLY a replan
-    viewer       read-only — sees the board, metrics, diagnostics, and can
-                 even ask for a proposal, but cannot commit one
+Proposing mutates nothing while applying does, so the permission boundary sits
+at the state change rather than at the whole feature.
 
-The viewer role is the interesting one: proposing is safe (it mutates nothing)
-while applying is not, so the permission boundary sits exactly where the state
-change happens rather than at the whole feature.
-
-Implementation notes
---------------------
 Passwords are scrypt hashes with a 16-byte per-user salt. Sessions are
-HMAC-SHA256-signed tokens carrying username, role and expiry — using stdlib
-primitives correctly rather than hand-rolling a cipher, and avoiding a JWT
-dependency for a payload this small. Comparisons are constant-time.
+HMAC-SHA256-signed tokens carrying username, role and expiry, compared in
+constant time, and ride in an httpOnly cookie so page JavaScript cannot read
+them.
 
-The token rides in an httpOnly cookie, so page JavaScript cannot read it and
-an XSS bug cannot exfiltrate the session. That is why the dashboard sends
-`credentials: "include"` and the API sets `allow_credentials=True` against an
-explicit origin list — a wildcard origin is not permitted with credentials.
-
-SECRET_KEY must be set in any real deployment. The development fallback is
-generated per-process, which invalidates every session on restart; that is
-deliberate, so an unset secret is noticed rather than silently insecure.
+PANELIST_SECRET_KEY must be set in a real deployment. The fallback is generated
+per-process and invalidates every session on restart, so an unset secret is
+noticed rather than silently insecure.
 """
 
 import base64
@@ -42,13 +30,12 @@ from fastapi import Cookie, Depends, HTTPException
 COOKIE_NAME = "panelist_session"
 SESSION_HOURS = 12
 
-# Marks the session cookie HTTPS-only. On by default whenever the deployment
-# says it is served over TLS; off locally, where http://localhost would
-# otherwise drop the cookie silently and make login look broken.
+# Marks the session cookie HTTPS-only. Off locally, where http://localhost
+# would drop the cookie silently and make login look broken.
 COOKIE_SECURE = os.environ.get("PANELIST_COOKIE_SECURE", "0") == "1"
-# "lax" is right while the page and the API share an origin, which is how the
-# dashboard proxies them in a deployment. Only a split-origin deployment needs
-# "none", and that additionally requires COOKIE_SECURE.
+# "lax" holds while the page and the API share an origin, which is how the
+# dashboard proxies them. A split-origin deployment needs "none", which
+# additionally requires COOKIE_SECURE.
 COOKIE_SAMESITE = os.environ.get("PANELIST_COOKIE_SAMESITE", "lax")
 
 _SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1, "dklen": 32}
@@ -140,9 +127,8 @@ def require_coordinator(user=Depends(current_user)):
 
 # --- demo accounts ---------------------------------------------------------
 #
-# Seeded on first start so a reviewer can sign in immediately. These are
-# evaluation credentials for a synthetic dataset, published in the README on
-# purpose; PANELIST_SEED_USERS=0 disables seeding entirely.
+# Seeded on first start. Evaluation credentials for a synthetic dataset,
+# published in the README on purpose; PANELIST_SEED_USERS=0 disables seeding.
 DEMO_USERS = [
     ("coordinator", "Priya Raman · Placement Coordinator", "coordinator",
      "placement2026"),

@@ -1,41 +1,20 @@
-"""
-Panelist — CP-SAT scheduling model.
+"""CP-SAT scheduling model, shared by the scheduler and the replanner.
 
-Shared model-building logic used by both the initial scheduler and the
-replanner (see PLACEMENT_SCHEDULER_GUIDE.md section 8: "don't duplicate
-solver logic between initial-schedule and replan paths").
-
-FORMULATION NOTE — deliberate deviation from guide section 2.2
---------------------------------------------------------------
-The guide suggests `assign[interview][room][slot][panel]` booleans. That does
-not scale to the guide's own numbers: 2770 interviews x 20 rooms x 112 slots
-is ~6.2M booleans before panels are indexed at all, and CP-SAT will not build
-that model in reasonable time or memory.
-
-This uses the idiomatic scheduling encoding instead:
-
-  - Two variables per interview: `start` (an IntVar restricted to starts where
-    the interview fits inside one contiguous work block) and `present` (a
-    BoolVar, so an interview may go unscheduled rather than forcing
-    infeasibility). No room or panel decision variables at all.
-  - Rooms are interchangeable, so room capacity is ONE global Cumulative
-    constraint (capacity = room count) rather than per-room booleans. Blocked
-    room windows enter as fixed intervals consuming that capacity.
-  - Panels are interchangeable within a company, so each company's panel limit
-    is ONE Cumulative (capacity = panel_count).
-  - Students get a NoOverlap over their own optional intervals.
+Two variables per interview: `start`, an IntVar over the slots where the
+interview fits inside one contiguous work block, and `present`, a BoolVar so an
+interview can go unscheduled instead of making the model infeasible. Rooms and
+panels are not decision variables — rooms are interchangeable, so room capacity
+is a single global Cumulative, and each company's panel limit is one Cumulative.
+Students get a NoOverlap over their own optional intervals. Blocked rooms and
+panel blackouts enter as fixed intervals consuming that capacity.
 
 Concrete room and panel identities are recovered after the solve by greedy
-interval-graph colouring, which is exact here: for interval graphs greedy
-left-to-right colouring uses exactly `max overlap` colours, and the Cumulative
-constraints guarantee max overlap never exceeds the available count. The
-assignment is verified post-hoc regardless (see `verify_schedule`).
+interval colouring, which is exact for interval graphs, and re-checked by
+`verify_schedule`.
 
-Because `present` is optional and the objective maximises scheduled
-interviews, an oversubscribed instance does not come back INFEASIBLE — it
-comes back with unscheduled interviews, each of which gets an attributed
-reason (see `diagnose_unscheduled`). That is a more specific and more useful
-diagnostic than a solver-level infeasibility certificate.
+Since `present` is optional and the objective maximises scheduled interviews,
+an oversubscribed instance returns a partial schedule plus an attributed
+shortfall (`diagnose_unscheduled`) rather than INFEASIBLE.
 """
 
 import os
@@ -45,20 +24,12 @@ from ortools.sat.python import cp_model
 
 from scheduler import timegrid
 
-# Coordinator priority overrides (guide section 4, question 2).
+# Coordinator overrides on top of the default tier weighting.
 #
-# The algorithm's DEFAULT is the tier weighting below: when an oversubscribed
-# instance cannot place everything, tier-1 mass recruiters are protected ahead
-# of tier-3 niche ones. That default is a policy decision, and the guide is
-# explicit that policy exceptions belong to the coordinator rather than to the
-# code — so a company can be lifted above the tier order or dropped below it.
-#
-# PROTECT exceeds any tier difference (16 at best) and any churn penalty
+# PROTECT_BONUS exceeds any tier difference (16 at most) and any churn penalty
 # (40 at the heaviest), so a protected interview is kept even when keeping it
-# costs a reshuffle. DEPRIORITISE leaves a weight of 1 rather than 0: the
-# company still gets scheduled wherever there is room, it simply yields to
-# everything else. Zero would tell the solver it is free to leave the company
-# out even on an empty grid, which is not what "lower priority" means.
+# costs a reshuffle. DEPRIORITISED_WEIGHT is 1 rather than 0 — the company is
+# still scheduled wherever there is room, it just yields to everything else.
 PRIORITY_LEVELS = ("protect", "normal", "deprioritise")
 PROTECT_BONUS = 100
 DEPRIORITISED_WEIGHT = 1
@@ -76,11 +47,7 @@ def panels_available(company, at):
     """Panels a company still has running at one instant.
 
     A blackout removes a panel from part of the week rather than lowering the
-    count for all of it, so "how many panels" is a question about a moment.
-    Shared with the replanner's lock validation, which asks exactly the same
-    question of an already-run schedule — the arithmetic was duplicated, and
-    the two copies have to agree or a replan is validated against different
-    capacity than it is verified against.
+    count for all of it, so panel availability is a question about a moment.
     """
     out = sum(1 for w0, w1 in company.get("panel_blackouts", []) if w0 <= at < w1)
     return max(0, company["panel_count"] - out)
@@ -103,26 +70,23 @@ class SchedulingModel:
         self.students = students
         self.rooms = rooms
         self.config = config
-        # Read from the dataset, never hardcoded: see scheduler/timegrid.py.
         self.slots_raw = timegrid.slots_per_day_raw(config)
         self.prior_schedule = prior_schedule or {}
         self.churn_penalty_weight = churn_penalty_weight
         self.tier_bonus = tier_bonus
-        # company_id -> "protect" | "deprioritise". Absent means the tier
-        # default applies, so an empty mapping reproduces the old behaviour
-        # exactly.
+        # company_id -> "protect" | "deprioritise"; absent means tier default.
         self.priority_overrides = dict(priority_overrides or {})
-        # Interviews that already happened: pinned to their prior time so a
-        # replan cannot rewrite the past.
+        # Interviews that already happened, pinned so a replan cannot rewrite
+        # the past.
         self.locked = set(locked or ())
 
         self.model = cp_model.CpModel()
         self.constraint_reasons = {}   # constraint_id -> human-readable string
 
         self.interviews = []           # list of interview dicts
-        # Interviews with no legal start slot at all. They never enter the CP
-        # model, but they are still real demand: initialised here so callers
-        # that skip build() (the diagnostics route) can read them safely.
+        # Interviews with no legal start slot. They never enter the CP model but
+        # are still demand; initialised here so callers that skip build() (the
+        # diagnostics route) can read them.
         self.unplaceable = []
         self.start = {}                # interview_id -> IntVar
         self.present = {}              # interview_id -> BoolVar
@@ -136,8 +100,7 @@ class SchedulingModel:
     # -- constraint provenance ---------------------------------------------
 
     def _tag(self, kind, scope, reason):
-        """Record a human-readable reason at construction time (guide s.8),
-        so diagnostics never have to be reverse-engineered after a failure."""
+        """Record why a constraint exists, for the diagnostics to quote back."""
         cid = f"{kind}:{scope}"
         self.constraint_reasons[cid] = reason
         return cid
@@ -148,7 +111,7 @@ class SchedulingModel:
         """Contiguous runs of usable slots within a day (morning, afternoon).
 
         An interview may not span lunch or a day boundary, so it must fit
-        entirely inside one block.
+        inside one block.
         """
         usable = sorted(self.config["usable_slots_per_day"])
         blocks, run = [], [usable[0]]
@@ -179,10 +142,9 @@ class SchedulingModel:
     def demand(self):
         """Every interview the instance has to place, modelled or not.
 
-        `self.interviews` holds only what reached the CP model; interviews
-        whose company has no remaining window are moved to `self.unplaceable`
-        and would otherwise disappear from every total. They are still demand,
-        so anything reporting on the size of the problem counts both.
+        `self.interviews` holds only what reached the CP model; interviews whose
+        company has no remaining window sit in `self.unplaceable`. Both count
+        towards the size of the problem.
         """
         return self.interviews + self.unplaceable
 
@@ -191,14 +153,9 @@ class SchedulingModel:
         unavailable windows.
 
         Windows are explicit (from_slot, to_slot) absolute ranges rather than a
-        single "available from" watermark. A company arriving three hours late
-        on Day 4 is unavailable for Day 4 up to 12:00 and nothing else — a
-        watermark would forbid every earlier day too, silently dragging Day 1
-        interviews across the week. Windows also compose, so several lateness
-        events on different days stack correctly.
-
-        Used for both the model domain and the diagnostics, so the two never
-        disagree about what was actually possible.
+        single "available from" watermark: a company arriving three hours late
+        on Day 4 is unavailable for that morning only, and several such events
+        compose. Used for both the model domain and the diagnostics.
         """
         starts = self.valid_starts[interview["duration_slots"]]
         company = self.company_by_id[interview["company_id"]]
@@ -217,9 +174,8 @@ class SchedulingModel:
     def _build_interviews(self):
         """One interview per (company, shortlisted student) pair.
 
-        CGPA cutoffs are enforced here rather than as a solver constraint: an
-        interview that would violate a cutoff is never created. Violations are
-        counted so the guarantee is verified rather than assumed.
+        CGPA cutoffs are enforced here rather than in the solver: an interview
+        that would violate one is never created.
         """
         cutoff_violations = []
         for c in self.companies:
@@ -254,19 +210,16 @@ class SchedulingModel:
             iid, dur = iv["id"], iv["duration_slots"]
             allowed = self.valid_starts_for(iv)
             if not allowed:
-                # The company has no remaining window this interview fits in.
-                # Recorded rather than silently dropped, so the diagnostics can
-                # say so explicitly.
+                # No remaining company window this interview fits in. Recorded
+                # rather than dropped so the diagnostics can say so.
                 self.unplaceable.append(iv)
                 continue
             prior = self.prior_schedule.get(iid)
             if iid in self.locked and prior is not None:
-                # Pin by narrowing the domain to a single value rather than
-                # adding `start == prior` as a constraint. Hundreds of equality
-                # constraints make the solve markedly harder (it timed out at
-                # UNKNOWN with 345 locked); a one-value domain propagates
-                # immediately and shrinks the search space instead of growing
-                # the constraint graph.
+                # Pin via a one-value domain rather than a `start == prior`
+                # constraint: hundreds of equality constraints slow the solve
+                # badly (UNKNOWN at 345 locked), while the narrow domain
+                # propagates immediately.
                 start = self.model.NewIntVar(
                     prior["start"], prior["start"], f"start_{iid}"
                 )
@@ -286,7 +239,6 @@ class SchedulingModel:
             if iid in self.locked and prior is not None:
                 self.model.Add(present == 1)
 
-        # Interviews with no legal slot never enter the model at all.
         self.interviews = [
             iv for iv in self.interviews if iv["id"] in self.start
         ]
@@ -334,9 +286,9 @@ class SchedulingModel:
             demands = [1] * len(iids)
 
             # A panel lost partway through the week consumes capacity from
-            # that moment on, the same way a blocked room does. Lowering
-            # panel_count for the whole week instead would retroactively
-            # invalidate interviews that already ran on that panel.
+            # that moment on, like a blocked room. Lowering panel_count for the
+            # whole week would retroactively invalidate interviews that already
+            # ran on it.
             for n, (w0, w1) in enumerate(company.get("panel_blackouts", [])):
                 panel_intervals.append(
                     self.model.NewIntervalVar(
@@ -389,10 +341,8 @@ class SchedulingModel:
     def interview_weight(self, interview):
         """What one scheduled interview is worth to the objective.
 
-        The tier term is the algorithm's own policy; the override is the
-        coordinator's exception to it. Kept as one function so the two cannot
-        drift apart, and so the diagnostics can report the same number the
-        solver optimised against.
+        The tier term is the default policy, the override the coordinator's
+        exception to it. The diagnostics report the same number.
         """
         level = self.priority_overrides.get(interview["company_id"])
         if level == "deprioritise":
@@ -405,10 +355,8 @@ class SchedulingModel:
     def _build_objective(self):
         """Maximise scheduled interviews; penalise churn against a prior plan.
 
-        Maximisation (rather than pure feasibility) is what lets one model
-        serve both a solvable instance and an oversubscribed one: a feasible
-        instance schedules everything, an oversubscribed one returns the best
-        partial schedule plus an attributed shortfall.
+        Maximising rather than seeking pure feasibility lets one model serve
+        both a solvable instance and an oversubscribed one.
         """
         terms = [
             self.interview_weight(iv) * self.present[iv["id"]]
@@ -463,13 +411,11 @@ class SchedulingModel:
     # -- warm start ---------------------------------------------------------
 
     def add_warm_start(self):
-        """Seed the solver with the prior schedule (guide section 2.3).
+        """Seed the solver with the prior schedule.
 
-        Only hints that are still legal are given. After a disruption some
-        prior placements are no longer in their variable's domain (the company
-        is now unavailable then, say); hinting those hands CP-SAT a partially
-        infeasible starting point it has to discover and unwind, which costs
-        more than the hint saves.
+        Only still-legal hints are given: after a disruption some prior
+        placements have left their variable's domain, and hinting those hands
+        CP-SAT an infeasible start it has to unwind.
         """
         if not self.prior_schedule:
             return 0
@@ -492,11 +438,8 @@ class SchedulingModel:
     def solve(self, time_limit_seconds=30, workers=None):
         """Solve, with the worker count matched to the machine.
 
-        A hardcoded 8 is wrong in both directions: on a one-vCPU serverless
-        instance it oversubscribes a single core, and on a bigger host it
-        leaves cores idle. PANELIST_SOLVER_WORKERS overrides for a container
-        whose CPU quota is smaller than the host's core count — `os.cpu_count`
-        reports the machine, not the cgroup limit.
+        `os.cpu_count` reports the host, not the cgroup limit, so a container
+        with a smaller CPU quota should set PANELIST_SOLVER_WORKERS.
         """
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = time_limit_seconds
@@ -505,7 +448,7 @@ class SchedulingModel:
         return status, solver
 
     def status_report(self, status, solver):
-        """Distinguish OPTIMAL / FEASIBLE / INFEASIBLE (guide section 9).
+        """Distinguish OPTIMAL / FEASIBLE / INFEASIBLE / UNKNOWN.
 
         FEASIBLE is an expected outcome at this scale, not a bug, and must not
         be reported as if it were OPTIMAL.
@@ -549,11 +492,9 @@ class SchedulingModel:
 
         Rooms and panels are assigned by greedy interval colouring; the
         Cumulative constraints guarantee enough of each exist at every instant.
+        Interviews that never entered the model start out unscheduled — leaving
+        them out would report 100% scheduled while demand was dropped.
         """
-        # Interviews with no legal slot never entered the model, so the solver
-        # has nothing to say about them — but they are unscheduled in exactly
-        # the sense the caller means, and omitting them makes pct_scheduled
-        # report 100% while interviews were silently dropped.
         scheduled, unscheduled = [], list(self.unplaceable)
         for iv in self.interviews:
             iid = iv["id"]
@@ -612,26 +553,19 @@ class SchedulingModel:
     def _assign_rooms(self, scheduled):
         """Assign concrete rooms, greedy first with an exact fallback.
 
-        Greedy interval colouring is exact only while rooms are fully
-        interchangeable. Blocked windows break that: a room free by time may
-        still be unavailable, so greedy can strand an interview that a
-        different assignment would have placed. Greedy stays as the fast path
-        (it succeeds on most instances), and when it strands anything the
-        whole assignment is redone exactly as a colouring-with-forbidden-
-        colours CP-SAT solve. Times are already fixed at this point, so the
-        fallback is small and fast.
+        Greedy interval colouring is exact only while rooms are interchangeable,
+        and blocked windows break that — a room free by time may still be
+        unavailable, so greedy can strand an interview another assignment would
+        have placed. When it strands anything the whole assignment is redone as
+        a colouring-with-forbidden-colours solve; times are already fixed by
+        then, so that fallback is small.
         """
         if self._greedy_rooms(scheduled):
             return
         self._exact_rooms(scheduled)
 
     def _room_free(self, blocked, rid, lo, hi):
-        """Is room `rid` clear of a blocking window over [lo, hi)?
-
-        A method rather than a closure defined identically in both the greedy
-        and the exact assignment: the two must agree about what "blocked"
-        means, and two copies of the predicate is how they stop agreeing.
-        """
+        """Is room `rid` clear of a blocking window over [lo, hi)?"""
         return not any(timegrid.overlaps(lo, hi, b0, b1) for b0, b1 in blocked[rid])
 
     def _greedy_rooms(self, scheduled):
@@ -640,10 +574,8 @@ class SchedulingModel:
         free_at = {r["id"]: 0 for r in self.rooms}
         ok = True
         for a in sorted(scheduled, key=lambda x: x["start"]):
-            # Prefer the room this interview was already in. Without this a
-            # replan reshuffles nearly every room even where the time did not
-            # change, and the coordinator sees the whole board move for a
-            # two-hour delay.
+            # Prefer the room this interview was already in, or a replan
+            # reshuffles nearly every room even where the time did not change.
             prior = self.prior_schedule.get(a["id"], {}).get("room")
             candidates = [r["id"] for r in self.rooms]
             if prior in free_at:
@@ -665,7 +597,8 @@ class SchedulingModel:
     def _exact_rooms(self, scheduled):
         """Exact room assignment: one IntVar per interview, domain restricted
         to rooms free of a blocking window, plus pairwise inequality over
-        interviews that overlap in time."""
+        interviews that overlap in time.
+        """
         blocked = self._blocked_windows()
         room_ids = [r["id"] for r in self.rooms]
 
@@ -696,21 +629,19 @@ class SchedulingModel:
             for a in scheduled:
                 a["room"] = room_ids[solver.Value(var[a["id"]])]
         else:
-            # Genuinely unassignable; verify_schedule will surface it.
+            # Genuinely unassignable; verify_schedule surfaces it.
             for a in scheduled:
                 a.setdefault("room", None)
 
     # -- diagnostics --------------------------------------------------------
 
     def capacity_analysis(self, scheduled, unscheduled):
-        """Structural headline: is this instance short on capacity, and where?
+        """Is this instance short on capacity, and where?
 
-        Per-company attribution is only meaningful once the coordinator knows
-        whether the shortfall is structural (no schedule could place these) or
-        local (a specific window is jammed). This answers that first, and names
-        the specific saturated windows the way guide section 2.2 asks for
-        ("Room capacity exceeded for Day 2, 14:00-16:00 by 6 interviews")
-        rather than repeating "rooms are full" per company.
+        Per-company attribution only means something once it is clear whether
+        the shortfall is structural (no schedule could place this demand) or
+        local (one window is jammed). This answers that, and names the
+        saturated windows rather than repeating "rooms are full" per company.
         """
         days = self.config["days"]
         slots_per_day = self.config["slots_per_day_count"]
@@ -733,14 +664,13 @@ class SchedulingModel:
 
         usable = set(self.config["usable_slots_per_day"])
 
-        # Contiguous runs of fully-saturated slots, as clock windows.
+        # Contiguous runs of fully-saturated slots, as clock windows. Runs
+        # break at a day boundary as well as at a gap, or a window wraps from
+        # one afternoon into the next morning and reports a nonsense range.
         saturated = sorted(
             t for t, n in load.items()
             if n >= n_rooms and (t % self.slots_raw) in usable
         )
-        # Runs must break at a day boundary as well as at a gap, or a window
-        # can wrap from one day's afternoon into the next day's morning and
-        # report a nonsense clock range.
         windows, run = [], []
         for t in saturated:
             same_day = run and (t // self.slots_raw) == (
@@ -755,10 +685,6 @@ class SchedulingModel:
         if run:
             windows.append(run)
 
-        # Contention per window: how many *distinct* unscheduled interviews
-        # could legally have started inside it. Counting every saturated slot
-        # an interview could use would just re-report the global unscheduled
-        # total on every window.
         window_report = []
         for w in sorted(windows, key=len, reverse=True)[:6]:
             day = w[0] // self.slots_raw
@@ -812,9 +738,8 @@ class SchedulingModel:
     def _window_label(self, w0, w1):
         """An absolute (from, to) slot pair as a readable clock range.
 
-        End-exclusive, so a window that stops on a day boundary is reported as
-        the end of the day it actually covers rather than 00:00 of the next
-        one — the same wrap `timegrid.clock` exists to avoid.
+        End-exclusive, so a window stopping on a day boundary reads as the end
+        of the day it covers rather than 00:00 of the next one.
         """
         d0, s0 = timegrid.split(self.config, w0)
         d1, s1 = timegrid.split(self.config, w1)
@@ -825,12 +750,10 @@ class SchedulingModel:
         return start if start == end else f"{start}\u2009\u2013\u2009{end}"
 
     def diagnose_unscheduled(self, scheduled, unscheduled):
-        """Attribute each unscheduled interview to a specific saturated resource.
+        """Attribute each unscheduled interview to a saturated resource.
 
-        This is the difference between "couldn't schedule 12 interviews" and
-        "Vandelay Corp: 44 interviews, 1 panel, ceiling is 37 — short by 7"
-        (guide section 5, item 2). Causes come from the constraint tags
-        recorded at construction time, not from post-hoc guesswork.
+        Causes come from the constraint tags recorded at construction time,
+        not from post-hoc guesswork.
         """
         if not unscheduled:
             return []
@@ -927,11 +850,8 @@ class SchedulingModel:
                     f"interviews."
                 )
             elif dominant == "company_window":
-                # These never reached the solver at all: the company is
-                # unavailable for every slot a full interview would fit in.
-                # Without its own branch this fell through to the student
-                # message below and blamed the cohort for the company's
-                # absence — with the room-capacity tag attached, no less.
+                # These never reached the solver: the company is unavailable
+                # for every slot a full interview would fit in.
                 windows = company.get("unavailable_windows") or []
                 when = "; ".join(
                     self._window_label(w0, w1) for w0, w1 in windows[:3]
@@ -954,11 +874,8 @@ class SchedulingModel:
             if dominant == "panel_capacity":
                 tag = f"panel_capacity:{cid}"
             elif dominant == "company_window":
-                # Recorded here rather than in build(): unplaceability is only
-                # known once a company's windows are consulted, and the
-                # diagnostics route reaches this without building the model.
-                # The tag states the CONSTRAINT; `reason` states this
-                # company's situation under it, so the two do not duplicate.
+                # Tagged here rather than in build(): the diagnostics route
+                # reaches this without ever building the model.
                 tag = self._tag(
                     "company_window", cid,
                     f"An interview may only start inside its company's "
@@ -985,8 +902,8 @@ class SchedulingModel:
     def verify_schedule(self, scheduled):
         """Independently re-check every hard constraint on the output.
 
-        The solver is trusted, but the greedy room/panel colouring is not —
-        this proves the recovered assignment is actually valid.
+        The solver is trusted; the greedy room/panel colouring on top of it is
+        not.
         """
         errors = []
         seen = defaultdict(list)
@@ -1012,7 +929,7 @@ class SchedulingModel:
                         f"({b['start']}-{b['end']})"
                     )
 
-        # Cutoffs (guaranteed by construction — verified, not assumed).
+        # Cutoffs are guaranteed by construction, but verified anyway.
         for a in scheduled:
             company = self.company_by_id[a["company_id"]]
             student = self.student_by_id[a["student_id"]]
@@ -1022,11 +939,8 @@ class SchedulingModel:
                     f"{company['cgpa_cutoff']}"
                 )
 
-        # Availability windows. Overlap and cutoffs were checked above; a room
-        # that is free by time can still be unavailable, and a company can be
-        # absent from an hour it has capacity in. Both enter the model as
-        # constraints and both are re-derived by the greedy colouring, which is
-        # exactly the code this method exists not to trust.
+        # A room free by time can still be unavailable, and a company can be
+        # absent from an hour it has capacity in.
         blocked = self._blocked_windows()
         for a in scheduled:
             rid = a.get("room")
@@ -1046,9 +960,8 @@ class SchedulingModel:
                     )
 
         # Panel capacity against mid-week blackouts. `_assign_panels` colours
-        # by index without knowing a panel walked out, so the index alone
-        # cannot show this: what matters is that the number running at once
-        # never exceeds the number still standing.
+        # by index without knowing a panel walked out, so what matters is that
+        # the number running at once never exceeds the number still standing.
         by_company = defaultdict(list)
         for a in scheduled:
             by_company[a["company_id"]].append(a)

@@ -1,14 +1,11 @@
-"""
-Panelist — propose a fix, review it, then commit it.
+"""Propose a fix, review it, then commit it.
 
-/replan never mutates state. The proposal it returns carries a token; only
-POST /replan/apply with that token changes the live schedule (guide section
-2.4: "apply or reject, not auto-applied").
+/replan never mutates state: the proposal it returns carries a token, and only
+POST /replan/apply with that token changes the live schedule.
 
-Proposals are held in the store, not in a process dict. A proposal is the one
-piece of state that gates a schedule mutation: kept in memory it is a 404 on
-any other worker, and every pending approval dies on restart while the
-schedule it was computed against survives.
+Proposals live in the store rather than a process dict — held in memory they
+are a 404 on any other worker, and every pending approval dies on restart while
+the schedule it was computed against survives.
 """
 
 import uuid
@@ -56,8 +53,8 @@ def propose(events, churn_cap_pct, time_limit_seconds, now_slot=None,
     pid = str(uuid.uuid4())
     store.put_proposal(pid, require_dataset(), proposal,
                        ttl_minutes=PROPOSAL_TTL_MINUTES)
-    # The full schedule is large and the coordinator reviews the diff, not the
-    # 1000-row board; it stays server-side until the proposal is applied.
+    # The full schedule stays server-side until the proposal is applied: the
+    # coordinator reviews the diff, not the thousand-row board.
     return {
         "proposal_id": pid,
         "ok": True,
@@ -72,11 +69,8 @@ def propose(events, churn_cap_pct, time_limit_seconds, now_slot=None,
         "authorization_prompt": proposal["authorization_prompt"],
         "verification_errors": proposal["verification_errors"],
         # How many interviews this fix leaves unplaced — the other half of the
-        # trade-off against churn, and the number the alternative usually
-        # pays in exchange for moving less.
+        # trade-off against churn.
         "unscheduled": len(proposal["unscheduled"]),
-        # The summary's presence is the flag; a separate boolean alongside it
-        # was two ways to say the same thing, and only one was ever read.
         "alternative": _summarise_alternative(proposal.get("alternative")),
         "priority_overrides": overrides,
     }
@@ -85,8 +79,8 @@ def propose(events, churn_cap_pct, time_limit_seconds, now_slot=None,
 def _summarise_alternative(alt):
     """The lower-churn option, as much as the coordinator needs to choose.
 
-    The full alternative schedule stays server-side with the proposal, exactly
-    like the primary one — this is the summary the choice is made on.
+    Its full schedule stays server-side with the proposal, like the primary
+    one.
     """
     if alt is None:
         return None
@@ -114,11 +108,9 @@ def propose_replan(req: ReplanRequest, _=Depends(current_user)):
 def commit_replan(req: ApplyRequest, _=Depends(require_coordinator)):
     """Commit a proposal the coordinator accepted.
 
-    When the first fix exceeded the churn cap the replanner also solved for a
-    lower-churn one, and `use_alternative` commits that instead. Both were
-    computed against the same schedule and the same events, so the choice
-    between them is the coordinator's alone: fewer interviews moved, usually
-    at the cost of a few more left unplaced.
+    `use_alternative` commits the lower-churn option instead. Both were
+    computed against the same schedule and events, and the trade is fewer
+    interviews moved for a few more left unplaced.
     """
     stored = store.get_proposal(req.proposal_id)
     if stored is None:
@@ -137,9 +129,8 @@ def commit_replan(req: ApplyRequest, _=Depends(require_coordinator)):
                 ),
             })
         proposal = alternative
-        # The audit trail records what CAUSED the replan, and the cause is the
-        # same either way; the alternative is built by the same function but
-        # never carries the events itself.
+        # The cause is the same either way, but the alternative does not carry
+        # the events itself.
         proposal["_events"] = stored.get("_events", [])
     try:
         schedule = apply_proposal(proposal)
@@ -147,9 +138,9 @@ def commit_replan(req: ApplyRequest, _=Depends(require_coordinator)):
         raise HTTPException(409, str(e))
 
     name = require_dataset()
-    # Persist the amended roster BEFORE the schedule. A proposal that added or
-    # removed a company changes the problem input, and saving only the schedule
-    # leaves appointments referencing a company the dataset no longer has.
+    # The amended roster is persisted before the schedule: saving only the
+    # schedule would leave appointments referencing a company the dataset no
+    # longer has.
     ds = proposal.get("dataset")
     if ds:
         store.amend_dataset(name, ds)
@@ -180,8 +171,6 @@ def commit_replan(req: ApplyRequest, _=Depends(require_coordinator)):
         "version": version,
         "metrics": metrics,
         "notify": proposal["notify"],
-        # Which of the two was committed, so the response is unambiguous in a
-        # log as well as on screen.
         "applied_alternative": bool(req.use_alternative),
         "label": proposal.get("label", "proposal"),
     }

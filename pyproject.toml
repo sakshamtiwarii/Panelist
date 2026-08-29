@@ -7,9 +7,8 @@ name = "panelist"
 version = "0.1.0"
 description = "Placement-week interview scheduler: CP-SAT solver, replanner and coordinator API."
 requires-python = ">=3.11"
-# Read from requirements.txt so there is exactly one dependency list: the
-# Docker layer that caches the (slow) ortools install reads the same file this
-# package is built from, and the two cannot drift.
+# Read from requirements.txt so the Docker layer that caches the slow ortools
+# install and this package are built from one list.
 dynamic = ["dependencies"]
 
 [tool.setuptools.dynamic]
@@ -23,9 +22,7 @@ panelist-generate = "generator.generate:main"
 panelist-solve = "scheduler.run:main"
 panelist-replan = "replanner.run:main"
 
-# Every package is importable by its real dotted name (api.auth, scheduler.model,
-# ...). This is what replaces the four sys.path.insert() calls: the packages are
-# installed rather than discovered by patching the path at import time, so the
+# Installed rather than discovered by patching sys.path at import time, so the
 # app runs identically from the repo root, from a container, and under pytest.
 [tool.setuptools]
 packages = ["api", "generator", "replanner", "scheduler", "store"]

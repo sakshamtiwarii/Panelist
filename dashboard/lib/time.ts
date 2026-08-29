@@ -1,8 +1,8 @@
 import type { ConfigResponse } from "./api";
 
 /**
- * Slot arithmetic mirrors the solver's, but the constants come from /config
- * rather than being redeclared here — a frontend copy that drifts from the
+ * Slot arithmetic mirroring the solver's. The constants come from /config
+ * rather than being redeclared here: a frontend copy that drifts from the
  * backend renders a board that is wrong without ever looking wrong.
  */
 export function makeClock(cfg: ConfigResponse) {

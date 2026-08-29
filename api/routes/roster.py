@@ -1,11 +1,9 @@
-"""
-Panelist — roster amendments.
+"""Roster amendments.
 
-These return a PROPOSAL, not a committed change. Adding a company means its
-interviews need slots that are already taken; removing one frees capacity the
-plan cannot use. Writing either straight to the database would leave the live
-schedule wrong while every metric still read zero clashes, because nothing
-re-checked it. Committing goes through POST /replan/apply like any other fix.
+These return a proposal, not a committed change: adding a company means its
+interviews need slots that are already taken, and removing one frees capacity
+the plan cannot use. Committing goes through POST /replan/apply like any other
+fix.
 """
 
 from fastapi import APIRouter, Depends

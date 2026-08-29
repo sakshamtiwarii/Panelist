@@ -1,10 +1,7 @@
-"""
-Panelist — FastAPI backend.
+"""FastAPI backend: app assembly.
 
-Thin HTTP wrapper over the generator, scheduler and replanner. All scheduling
-logic lives in those modules; this layer only loads state, calls them, and
-shapes responses. This file is now only app assembly — the surface itself is
-split by area:
+A thin HTTP wrapper over the generator, scheduler and replanner — all
+scheduling logic lives in those modules. The surface is split by area:
 
     api/routes/auth.py      sign in, sign out, whoami
     api/routes/schedule.py  generate, solve, board, metrics, diagnostics
@@ -13,9 +10,8 @@ split by area:
     api/deps.py             the store and the live-dataset accessors
     api/schemas.py          request bodies
 
-Schedule state is persisted by `store/` — Postgres when DATABASE_URL reaches a
-server, an in-memory stand-in otherwise. Schedules are versioned, not mutated,
-so the plan that existed before a disruption survives it.
+State is persisted by `store/`. Schedules are versioned, not mutated, so the
+plan that existed before a disruption survives it.
 """
 
 import os
@@ -45,11 +41,9 @@ from scheduler import timegrid
 
 app = FastAPI(title="Panelist API")
 
-# The dashboard is served from a different origin (:3000) than the API
-# (:8000), so every browser request is cross-origin and is blocked outright
-# without this — including the preflight OPTIONS, which returns 405 from a
-# bare FastAPI app. Server-side clients (curl, TestClient) never exercise
-# this path, so it stays invisible until a browser actually hits the API.
+# The dashboard runs on a different origin (:3000) than the API (:8000), so
+# every browser request is cross-origin. Server-side clients (curl, TestClient)
+# never exercise this path.
 DASHBOARD_ORIGINS = [
     o.strip() for o in os.environ.get(
         "PANELIST_CORS_ORIGINS",
@@ -60,12 +54,10 @@ DASHBOARD_ORIGINS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=DASHBOARD_ORIGINS,
-    # Required for the session cookie to cross from the dashboard origin.
-    # Only legal against an explicit origin list, never a wildcard.
+    # Required for the session cookie, and only legal against an explicit
+    # origin list rather than a wildcard.
     allow_credentials=True,
-    # DELETE is here for the /roster endpoints; a method missing from this
-    # list fails at the preflight, which reads like a backend error rather
-    # than a CORS one.
+    # DELETE is for the /roster endpoints.
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type"],
 )
@@ -78,9 +70,8 @@ app.include_router(replan_routes.router)
 
 @app.get("/health")
 def health():
-    # The version alone answers both questions here. Reading the whole current
-    # schedule to learn that one number pulled every appointment out of the
-    # database on a call the dashboard makes on every load.
+    # The version alone answers both questions, without pulling every
+    # appointment out of the database on a call made on every page load.
     name = dataset_name()
     version = store.current_version(name) if name else None
     return {
@@ -100,10 +91,8 @@ def health():
 def get_config(_=Depends(current_user)):
     """Everything the UI needs to render a grid: time model, rooms, companies.
 
-    Served from the API so the dashboard never hardcodes the slot arithmetic —
-    a frontend copy of the slot grid that drifts from the backend produces a
-    schedule board that is subtly, silently wrong. Both values are read from
-    the dataset's own config rather than restated here, for the same reason.
+    Served from the API so the dashboard never hardcodes slot arithmetic that
+    could drift from the backend's.
     """
     ds = loaded_dataset() or read_dataset_file(DEFAULT_DATASET)
     return {
@@ -120,8 +109,6 @@ def get_config(_=Depends(current_user)):
              "panel_count": c["panel_count"],
              "interview_minutes": c["interview_minutes"],
              "shortlist_size": c["shortlist_size"],
-             # The UI shows the cutoff beside the company picker so a
-             # coordinator sees why a student is ineligible before submitting.
              "cgpa_cutoff": c["cgpa_cutoff"]}
             for c in ds["companies"]
         ],
@@ -137,11 +124,8 @@ def _seed_accounts():
 def _restore_on_startup():
     """Adopt a schedule that outlived the last process.
 
-    Without this, persistence is write-only: the tables hold a current
-    schedule but a restarted API reports "no schedule" until someone re-solves,
-    which is exactly the situation the database was added to prevent. It also
-    matters for the live defense — a restarted container should come back with
-    the week already planned rather than needing a 30s solve.
+    Without this, persistence is write-only: the tables hold a current schedule
+    but a restarted API reports "no schedule" until someone re-solves.
     """
     if store.kind != "postgres":
         return
@@ -154,11 +138,9 @@ def _restore_on_startup():
         if ds is None:
             return
 
-        # A dataset persisted by an older build can be missing time-model keys.
-        # Adopting it anyway means every grid-touching endpoint 500s with no
-        # way back except knowing to re-solve; starting clean instead leaves
-        # the console in its ordinary "no schedule yet" state, where pressing
-        # Build fixes it.
+        # A dataset persisted by an older build can be missing time-model
+        # keys. Adopting it would 500 every grid-touching endpoint; starting
+        # clean leaves the console in its "no schedule yet" state instead.
         stale = timegrid.missing_keys(ds.get("config"))
         if stale:
             print(f"[store] ignoring stored schedule for {name!r}: its config "
@@ -174,8 +156,8 @@ def _restore_on_startup():
         print(f"[store] could not restore previous schedule: {e}")
 
 
-# The week a reviewer lands on. Seeded and reproducible, and matching the
-# dataset the README and CI describe, so what they see is what is documented.
+# The seeded week a fresh deployment opens on. Matches the dataset the README
+# and CI describe.
 DEMO_DATASET = {
     "seed": 42, "companies": 35, "students": 800,
     "rooms": 20, "days": 4, "load_factor": 0.9,
@@ -186,14 +168,9 @@ DEMO_SOLVE_SECONDS = 60
 def _seed_demo_schedule():
     """Put a solved week on the board before anyone signs in.
 
-    `data/` is generated, not committed, so a fresh deployment starts with no
-    dataset and no schedule: the reviewer's first screen is an empty board and
-    a Build button, and the first thing the app asks of them is a chore. This
-    generates the documented dataset and solves it on first boot instead —
-    roughly two seconds, because the instance is seeded and solves to OPTIMAL.
-
-    Skipped entirely once a schedule exists, so a restart adopts the real one
-    (see `_restore_on_startup`) rather than overwriting it, and disabled with
+    `data/` is generated rather than committed, so a fresh deployment would
+    otherwise open on an empty board. Skipped once a schedule exists, so a
+    restart adopts the real one via `_restore_on_startup`; set
     PANELIST_DEMO_SEED=0 for a deployment that carries its own data.
     """
     if os.environ.get("PANELIST_DEMO_SEED", "1") != "1":
@@ -210,11 +187,9 @@ def _seed_demo_schedule():
             print(f"[seed] generated {DEFAULT_DATASET!r} "
                   f"({DEMO_DATASET['companies']} companies, "
                   f"{DEMO_DATASET['students']} students)")
-            # Written out so the CLIs and the replan scenario suite work
-            # against the same week the console is showing. Best-effort: a
-            # serverless filesystem is read-only outside /tmp, and the
-            # schedule lives in the database regardless — losing the file
-            # costs the CLIs a regeneration, not the deployment its data.
+            # So the CLIs and the replan scenarios work against the same week
+            # the console shows. Best-effort: a serverless filesystem is
+            # read-only outside /tmp, and the schedule is in the store anyway.
             try:
                 write_dataset(
                     os.path.join(DATA_ROOT, DEFAULT_DATASET), ds, report)

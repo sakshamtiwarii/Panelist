@@ -1,14 +1,12 @@
-"""
-Panelist — the two stores must agree.
+"""The two stores must agree.
 
-`store/db.py` claims "two stores implement one interface", and the API relies
-on it: when Postgres is unreachable the app keeps serving from memory, so a
-behavioural difference between them shows up as a bug that only appears when
-the database is down (or only when it is up). Nothing checked that claim.
+The API falls back to memory when Postgres is unreachable, so a behavioural
+difference between the stores becomes a bug that appears only when the database
+is down, or only when it is up.
 
-Every test here runs against BOTH stores and asserts the same outcome. The
-Postgres half is skipped unless PANELIST_TEST_DATABASE_URL points at a server,
-so a laptop with no database still runs the suite; CI sets it.
+Every test runs against both and asserts the same outcome. The Postgres half is
+skipped unless PANELIST_TEST_DATABASE_URL points at a server, so a laptop with
+no database still runs the suite; CI sets it.
 """
 
 import os
