@@ -14,10 +14,14 @@ died, and a live defense should not open with a connection error. `GET /health`
 reports which store is active, so the degradation is visible rather than silent.
 """
 
+import contextlib
+import datetime
 import json
 import os
 import pathlib
+import threading
 import time
+from collections import defaultdict
 
 SCHEMA_PATH = pathlib.Path(__file__).with_name("schema.sql")
 
@@ -66,6 +70,7 @@ class MemoryStore:
         self._schedules = {}   # dataset -> list of version dicts
         self._replans = {}     # dataset -> list
         self._users = {}
+        self._proposals = {}   # proposal_id -> {dataset, payload, expires}
 
     def describe(self):
         return "in-memory (not persisted)"
@@ -92,6 +97,7 @@ class MemoryStore:
             "origin": origin,
             "solver_status": report.get("status") if report else None,
             "solve_seconds": report.get("wall_time_seconds") if report else None,
+            "created_at": datetime.datetime.now(datetime.timezone.utc),
             "metrics": metrics,
             "scheduled": scheduled,
             "unscheduled": list(unscheduled),
@@ -104,10 +110,27 @@ class MemoryStore:
         return versions[-1] if versions else None
 
     def versions(self, dataset):
-        return [
-            {k: v for k, v in e.items() if k not in ("scheduled", "unscheduled")}
-            for e in self._schedules.get(dataset, [])
-        ]
+        """Newest first, with the same keys PostgresStore returns.
+
+        The shape and the order are part of the API contract, not an accident
+        of how each store happens to hold its rows: /schedule/versions must not
+        answer differently depending on whether the database was reachable.
+        """
+        versions = self._schedules.get(dataset, [])
+        return [{
+            "version": e["version"],
+            "origin": e["origin"],
+            "solver_status": e["solver_status"],
+            "is_current": e["version"] == len(versions),
+            "created_at": e["created_at"].isoformat(),
+            "appointments": len(e["scheduled"]),
+        } for e in reversed(versions)]
+
+    def current_dataset(self):
+        for name, versions in self._schedules.items():
+            if versions:
+                return name
+        return None
 
     # -- replan audit ----------------------------------------------------
     def record_replan(self, dataset, disruptions, proposal, to_version):
@@ -125,6 +148,25 @@ class MemoryStore:
 
     def replan_history(self, dataset, limit=20):
         return list(reversed(self._replans.get(dataset, [])))[:limit]
+
+    # -- proposals -------------------------------------------------------
+    def put_proposal(self, pid, dataset, payload, ttl_minutes=30):
+        self._proposals[pid] = {
+            "dataset": dataset, "payload": payload,
+            "expires": time.time() + ttl_minutes * 60,
+        }
+
+    def get_proposal(self, pid):
+        row = self._proposals.get(pid)
+        if row is None or row["expires"] < time.time():
+            self._proposals.pop(pid, None)
+            return None
+        return row["payload"]
+
+    def clear_proposals(self, dataset):
+        for pid, row in list(self._proposals.items()):
+            if row["dataset"] == dataset:
+                del self._proposals[pid]
 
     # -- users -----------------------------------------------------------
     def put_user(self, username, display_name, role, salt, password_hash):
@@ -151,23 +193,32 @@ class MemoryStore:
             and (room is None or a.get("room") == room)
             and (day is None or a["day"] == day)
         ]
-        sids = {a["student_id"] for a in hit}
         ds = self._datasets.get(dataset, {})
         cgpa = {s["id"]: s["cgpa"] for s in ds.get("students", [])}
+
+        by_student = defaultdict(list)
+        for a in hit:
+            by_student[a["student_id"]].append(a)
+
         out = []
-        for sid in sorted(sids):
-            same_day = [
-                a for a in rows
-                if a["student_id"] == sid
-                and (day is None or a["day"] == day)
-            ]
+        for sid, mine in by_student.items():
+            # "That day" means the days this student was actually hit on, not
+            # the whole week. With no day filter the old code counted every
+            # interview they had all week, which answers a different question
+            # than the column name — and a different one than the SQL store.
+            hit_days = {a["day"] for a in mine}
+            same_day = sum(
+                1 for a in rows
+                if a["student_id"] == sid and a["day"] in hit_days
+            )
             out.append({
                 "student_id": sid,
                 "cgpa": cgpa.get(sid),
-                "interviews_hit": sum(1 for a in hit if a["student_id"] == sid),
-                "other_interviews_that_day": len(same_day)
-                - sum(1 for a in hit if a["student_id"] == sid),
+                "interviews_hit": len(mine),
+                "other_interviews_that_day": same_day - len(mine),
             })
+        # Same order as PostgresStore: worst-hit first, ties by id.
+        out.sort(key=lambda r: (-r["interviews_hit"], r["student_id"]))
         return out
 
 
@@ -182,9 +233,25 @@ class PostgresStore:
         self.url = url
         self.conn = psycopg2.connect(url)
         self.conn.autocommit = False
+        self._lock = threading.RLock()
+
+    @contextlib.contextmanager
+    def _tx(self):
+        """A transaction with exclusive use of the single connection.
+
+        FastAPI runs sync endpoints in a threadpool, so concurrent requests
+        share this store — and the dashboard deliberately fires /schedule and
+        /metrics together. A psycopg2 connection is not safe for concurrent
+        transactions and `with conn` is not reentrant, so without this the
+        second thread dies with "the connection cannot be re-entered
+        recursively" while the first succeeds: an error that appears only
+        under real concurrency, and never in a sequential test.
+        """
+        with self._lock, self.conn, self.conn.cursor() as cur:
+            yield cur
 
     def describe(self):
-        with self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute("select current_database()")
             return f"database {cur.fetchone()[0]}"
 
@@ -195,14 +262,14 @@ class PostgresStore:
             pass
 
     def init_schema(self):
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(SCHEMA_PATH.read_text())
 
     # -- datasets --------------------------------------------------------
     def put_dataset(self, name, ds):
         """Replace a dataset wholesale. Cascades wipe dependent schedules,
         which is correct: a schedule for different input data is meaningless."""
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute("DELETE FROM datasets WHERE name = %s", (name,))
             cur.execute(
                 "INSERT INTO datasets (name, seed, config) VALUES (%s, %s, %s)",
@@ -238,7 +305,7 @@ class PostgresStore:
 
     def get_dataset(self, name):
         """Rebuild the solver's input dict from the tables."""
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 "SELECT seed, config FROM datasets WHERE name = %s", (name,))
             row = cur.fetchone()
@@ -304,7 +371,7 @@ class PostgresStore:
         """
         companies = ds["companies"]
         keep = [c["id"] for c in companies]
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.executemany(
                 """INSERT INTO companies (dataset, id, name, tier, cgpa_cutoff,
                        panel_count, interview_minutes, duration_slots,
@@ -352,7 +419,7 @@ class PostgresStore:
     # -- schedules -------------------------------------------------------
     def put_schedule(self, dataset, scheduled, unscheduled, report, metrics,
                      origin="solve"):
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 "SELECT COALESCE(MAX(version), 0) + 1 FROM schedules WHERE dataset = %s",
                 (dataset,))
@@ -387,7 +454,7 @@ class PostgresStore:
         return version
 
     def get_current(self, dataset):
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 """SELECT id, version, origin, solver_status, solve_seconds, metrics
                    FROM schedules WHERE dataset = %s AND is_current""", (dataset,))
@@ -416,7 +483,7 @@ class PostgresStore:
         }
 
     def versions(self, dataset):
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 """SELECT s.version, s.origin, s.solver_status, s.is_current,
                           s.created_at, COUNT(a.interview_id)
@@ -430,10 +497,21 @@ class PostgresStore:
                 "appointments": r[5],
             } for r in cur.fetchall()]
 
+    def current_dataset(self):
+        """The dataset that has a live schedule, or None.
+
+        Lets a freshly-started worker find the current dataset instead of
+        depending on having served the request that solved it.
+        """
+        with self._tx() as cur:
+            cur.execute("SELECT dataset FROM schedules WHERE is_current LIMIT 1")
+            row = cur.fetchone()
+        return row[0] if row else None
+
     # -- replan audit ----------------------------------------------------
     def record_replan(self, dataset, disruptions, proposal, to_version):
         d = proposal["diff"]
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 "SELECT id FROM schedules WHERE dataset = %s AND version = %s",
                 (dataset, to_version))
@@ -462,7 +540,7 @@ class PostgresStore:
                  json.dumps(proposal["notify"])))
 
     def replan_history(self, dataset, limit=20):
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 """SELECT applied_at, descriptions, elective_churn, forced_churn,
                           churn_pct, cap_exceeded, notify_count, to_schedule
@@ -475,9 +553,38 @@ class PostgresStore:
                 "notify_count": r[6], "schedule_id": r[7],
             } for r in cur.fetchall()]
 
+    # -- proposals -------------------------------------------------------
+    def put_proposal(self, pid, dataset, payload, ttl_minutes=30):
+        with self._tx() as cur:
+            cur.execute(
+                """INSERT INTO proposals (id, dataset, payload, expires_at)
+                   VALUES (%s, %s, %s, now() + make_interval(mins => %s))""",
+                (pid, dataset, json.dumps(payload), ttl_minutes))
+
+    def get_proposal(self, pid):
+        """The stored proposal, or None if unknown or expired."""
+        with self._tx() as cur:
+            cur.execute(
+                "SELECT payload FROM proposals WHERE id = %s AND expires_at > now()",
+                (pid,))
+            row = cur.fetchone()
+        return row[0] if row else None
+
+    def clear_proposals(self, dataset):
+        """Drop every pending proposal for a dataset.
+
+        Called after one is applied: the rest were computed against a schedule
+        that no longer exists, so applying them would silently write a plan
+        built from stale state. Expired rows go at the same time.
+        """
+        with self._tx() as cur:
+            cur.execute(
+                "DELETE FROM proposals WHERE dataset = %s OR expires_at <= now()",
+                (dataset,))
+
     # -- users -----------------------------------------------------------
     def put_user(self, username, display_name, role, salt, password_hash):
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 """INSERT INTO users (username, display_name, role, salt, password_hash)
                    VALUES (%s,%s,%s,%s,%s)
@@ -491,7 +598,7 @@ class PostgresStore:
                  self._psycopg2.Binary(password_hash)))
 
     def get_user(self, username):
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 """SELECT username, display_name, role, salt, password_hash
                    FROM users WHERE username = %s""", (username,))
@@ -502,7 +609,7 @@ class PostgresStore:
                 "salt": bytes(r[3]), "password_hash": bytes(r[4])}
 
     def touch_login(self, username):
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(
                 "UPDATE users SET last_login = now() WHERE username = %s",
                 (username,))
@@ -533,21 +640,31 @@ class PostgresStore:
                 JOIN schedules s ON s.id = a.schedule_id
                 WHERE {' AND '.join(clauses)}
                 GROUP BY a.schedule_id, a.student_id, a.day
+            ),
+            -- Per (student, day) hit: what ELSE that student has that same
+            -- day. Kept as its own step so the correlated count stays scoped
+            -- to the day, while the final grouping is per student.
+            per_day AS (
+                SELECT h.student_id, h.n,
+                       (SELECT COUNT(*) FROM appointments o
+                         WHERE o.schedule_id = h.schedule_id
+                           AND o.student_id  = h.student_id
+                           AND o.day         = h.day) - h.n AS others
+                FROM hit h
             )
-            SELECT h.student_id,
+            -- One row per student. Grouping by h.day as well used to emit a
+            -- row per student-day, so an unfiltered query reported more
+            -- students affected than there were students.
+            SELECT p.student_id,
                    st.cgpa,
-                   SUM(h.n)::int AS interviews_hit,
-                   (SELECT COUNT(*) FROM appointments o
-                     WHERE o.schedule_id = h.schedule_id
-                       AND o.student_id = h.student_id
-                       AND o.day = h.day)::int - SUM(h.n)::int
-                       AS other_interviews_that_day
-            FROM hit h
-            JOIN students st ON st.dataset = %s AND st.id = h.student_id
-            GROUP BY h.student_id, st.cgpa, h.schedule_id, h.day
-            ORDER BY interviews_hit DESC, h.student_id
+                   SUM(p.n)::int      AS interviews_hit,
+                   SUM(p.others)::int AS other_interviews_that_day
+            FROM per_day p
+            JOIN students st ON st.dataset = %s AND st.id = p.student_id
+            GROUP BY p.student_id, st.cgpa
+            ORDER BY interviews_hit DESC, p.student_id
         """
-        with self.conn, self.conn.cursor() as cur:
+        with self._tx() as cur:
             cur.execute(sql, params + [dataset])
             return [{
                 "student_id": r[0], "cgpa": r[1],

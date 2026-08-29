@@ -25,3 +25,6 @@ npm-debug.log*
 .DS_Store
 .idea/
 *.swp
+
+# TypeScript incremental build cache
+*.tsbuildinfo

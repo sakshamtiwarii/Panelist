@@ -1,0 +1,22 @@
+# The API build context is now the repo root, so everything the image does not
+# need must be excluded explicitly — without this the dashboard's node_modules
+# and the generated datasets are uploaded to the daemon on every build.
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Generated datasets: bind-mounted at runtime, never baked into the image.
+data/
+*.solution.json
+
+dashboard/
+tests/
+
+.env
+.env.local
+.DS_Store
+.idea/

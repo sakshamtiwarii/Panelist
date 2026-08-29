@@ -42,9 +42,25 @@ from collections import defaultdict
 
 from ortools.sat.python import cp_model
 
-# Slots per day on the raw grid, including the (unusable) lunch band, so that
-# absolute_slot = day * SLOTS_PER_DAY_RAW + slot_in_day stays simple.
-SLOTS_PER_DAY_RAW = 32
+from scheduler import timegrid
+
+# Coordinator priority overrides (guide section 4, question 2).
+#
+# The algorithm's DEFAULT is the tier weighting below: when an oversubscribed
+# instance cannot place everything, tier-1 mass recruiters are protected ahead
+# of tier-3 niche ones. That default is a policy decision, and the guide is
+# explicit that policy exceptions belong to the coordinator rather than to the
+# code — so a company can be lifted above the tier order or dropped below it.
+#
+# PROTECT exceeds any tier difference (16 at best) and any churn penalty
+# (40 at the heaviest), so a protected interview is kept even when keeping it
+# costs a reshuffle. DEPRIORITISE leaves a weight of 1 rather than 0: the
+# company still gets scheduled wherever there is room, it simply yields to
+# everything else. Zero would tell the solver it is free to leave the company
+# out even on an empty grid, which is not what "lower priority" means.
+PRIORITY_LEVELS = ("protect", "normal", "deprioritise")
+PROTECT_BONUS = 100
+DEPRIORITISED_WEIGHT = 1
 
 
 class SchedulingModel:
@@ -58,14 +74,21 @@ class SchedulingModel:
         churn_penalty_weight=0,
         tier_bonus=2,
         locked=None,
+        priority_overrides=None,
     ):
         self.companies = companies
         self.students = students
         self.rooms = rooms
         self.config = config
+        # Read from the dataset, never hardcoded: see scheduler/timegrid.py.
+        self.slots_raw = timegrid.slots_per_day_raw(config)
         self.prior_schedule = prior_schedule or {}
         self.churn_penalty_weight = churn_penalty_weight
         self.tier_bonus = tier_bonus
+        # company_id -> "protect" | "deprioritise". Absent means the tier
+        # default applies, so an empty mapping reproduces the old behaviour
+        # exactly.
+        self.priority_overrides = dict(priority_overrides or {})
         # Interviews that already happened: pinned to their prior time so a
         # replan cannot rewrite the past.
         self.locked = set(locked or ())
@@ -74,6 +97,10 @@ class SchedulingModel:
         self.constraint_reasons = {}   # constraint_id -> human-readable string
 
         self.interviews = []           # list of interview dicts
+        # Interviews with no legal start slot at all. They never enter the CP
+        # model, but they are still real demand: initialised here so callers
+        # that skip build() (the diagnostics route) can read them safely.
+        self.unplaceable = []
         self.start = {}                # interview_id -> IntVar
         self.present = {}              # interview_id -> BoolVar
         self.intervals = {}            # interview_id -> OptionalIntervalVar
@@ -120,11 +147,21 @@ class SchedulingModel:
             for day in range(self.config["days"]):
                 for lo, hi in blocks:
                     for s in range(lo, hi - dur + 1):
-                        by_duration[dur].append(day * SLOTS_PER_DAY_RAW + s)
+                        by_duration[dur].append(day * self.slots_raw + s)
         return by_duration
 
     def horizon(self):
-        return self.config["days"] * SLOTS_PER_DAY_RAW
+        return timegrid.horizon(self.config)
+
+    def demand(self):
+        """Every interview the instance has to place, modelled or not.
+
+        `self.interviews` holds only what reached the CP model; interviews
+        whose company has no remaining window are moved to `self.unplaceable`
+        and would otherwise disappear from every total. They are still demand,
+        so anything reporting on the size of the problem counts both.
+        """
+        return self.interviews + self.unplaceable
 
     def valid_starts_for(self, interview):
         """Start slots legal for one interview, narrowed by its company's
@@ -301,8 +338,8 @@ class SchedulingModel:
         demands = [1] * len(room_intervals)
         for room in self.rooms:
             for w in room.get("blocked_windows", []):
-                lo = w["day"] * SLOTS_PER_DAY_RAW + w["from_slot"]
-                hi = w["day"] * SLOTS_PER_DAY_RAW + w["to_slot"]
+                lo = w["day"] * self.slots_raw + w["from_slot"]
+                hi = w["day"] * self.slots_raw + w["to_slot"]
                 room_intervals.append(
                     self.model.NewIntervalVar(
                         lo, hi - lo, hi, f"blocked_{room['id']}_{w['day']}"
@@ -325,6 +362,22 @@ class SchedulingModel:
         self._build_objective()
         return self
 
+    def interview_weight(self, interview):
+        """What one scheduled interview is worth to the objective.
+
+        The tier term is the algorithm's own policy; the override is the
+        coordinator's exception to it. Kept as one function so the two cannot
+        drift apart, and so the diagnostics can report the same number the
+        solver optimised against.
+        """
+        level = self.priority_overrides.get(interview["company_id"])
+        if level == "deprioritise":
+            return DEPRIORITISED_WEIGHT
+        weight = 10 + self.tier_bonus * (4 - interview["tier"])
+        if level == "protect":
+            weight += PROTECT_BONUS
+        return weight
+
     def _build_objective(self):
         """Maximise scheduled interviews; penalise churn against a prior plan.
 
@@ -335,8 +388,28 @@ class SchedulingModel:
         """
         terms = []
         for iv in self.interviews:
-            weight = 10 + self.tier_bonus * (4 - iv["tier"])
-            terms.append(weight * self.present[iv["id"]])
+            terms.append(
+                self.interview_weight(iv) * self.present[iv["id"]]
+            )
+
+        for cid, level in sorted(self.priority_overrides.items()):
+            company = self.company_by_id.get(cid)
+            if company is None or level not in PRIORITY_LEVELS:
+                continue
+            if level == "protect":
+                self._tag(
+                    "priority_override", cid,
+                    f"The coordinator protected {company['name']}: its "
+                    f"interviews are kept ahead of the tier order, and ahead "
+                    f"of the cost of moving others to make room.",
+                )
+            elif level == "deprioritise":
+                self._tag(
+                    "priority_override", cid,
+                    f"The coordinator deprioritised {company['name']}: it is "
+                    f"scheduled wherever there is room, but yields to every "
+                    f"other company when capacity is short.",
+                )
 
         if self.prior_schedule and self.churn_penalty_weight:
             for iv in self.interviews:
@@ -446,7 +519,11 @@ class SchedulingModel:
         Rooms and panels are assigned by greedy interval colouring; the
         Cumulative constraints guarantee enough of each exist at every instant.
         """
-        scheduled, unscheduled = [], []
+        # Interviews with no legal slot never entered the model, so the solver
+        # has nothing to say about them — but they are unscheduled in exactly
+        # the sense the caller means, and omitting them makes pct_scheduled
+        # report 100% while interviews were silently dropped.
+        scheduled, unscheduled = [], list(self.unplaceable)
         for iv in self.interviews:
             iid = iv["id"]
             if not solver.Value(self.present[iid]):
@@ -457,8 +534,8 @@ class SchedulingModel:
                 **iv,
                 "start": abs_start,
                 "end": abs_start + iv["duration_slots"],
-                "day": abs_start // SLOTS_PER_DAY_RAW,
-                "slot": abs_start % SLOTS_PER_DAY_RAW,
+                "day": abs_start // self.slots_raw,
+                "slot": abs_start % self.slots_raw,
             })
 
         self._assign_panels(scheduled)
@@ -496,8 +573,8 @@ class SchedulingModel:
         blocked = defaultdict(list)
         for room in self.rooms:
             for w in room.get("blocked_windows", []):
-                lo = w["day"] * SLOTS_PER_DAY_RAW + w["from_slot"]
-                hi = w["day"] * SLOTS_PER_DAY_RAW + w["to_slot"]
+                lo = w["day"] * self.slots_raw + w["from_slot"]
+                hi = w["day"] * self.slots_raw + w["to_slot"]
                 blocked[room["id"]].append((lo, hi))
         return blocked
 
@@ -606,7 +683,8 @@ class SchedulingModel:
         n_rooms = len(self.rooms)
         slot_minutes = self.config["slot_minutes"]
 
-        demand_slots = sum(iv["duration_slots"] for iv in self.interviews)
+        demand = self.demand()
+        demand_slots = sum(iv["duration_slots"] for iv in demand)
         capacity_slots = n_rooms * slots_per_day * days
 
         load = defaultdict(int)
@@ -615,7 +693,7 @@ class SchedulingModel:
                 load[t] += 1
         for room in self.rooms:
             for w in room.get("blocked_windows", []):
-                base = w["day"] * SLOTS_PER_DAY_RAW
+                base = w["day"] * self.slots_raw
                 for t in range(base + w["from_slot"], base + w["to_slot"]):
                     load[t] += 1
 
@@ -624,15 +702,15 @@ class SchedulingModel:
         # Contiguous runs of fully-saturated slots, as clock windows.
         saturated = sorted(
             t for t, n in load.items()
-            if n >= n_rooms and (t % SLOTS_PER_DAY_RAW) in usable
+            if n >= n_rooms and (t % self.slots_raw) in usable
         )
         # Runs must break at a day boundary as well as at a gap, or a window
         # can wrap from one day's afternoon into the next day's morning and
         # report a nonsense clock range.
         windows, run = [], []
         for t in saturated:
-            same_day = run and (t // SLOTS_PER_DAY_RAW) == (
-                run[-1] // SLOTS_PER_DAY_RAW
+            same_day = run and (t // self.slots_raw) == (
+                run[-1] // self.slots_raw
             )
             if same_day and t == run[-1] + 1:
                 run.append(t)
@@ -643,25 +721,15 @@ class SchedulingModel:
         if run:
             windows.append(run)
 
-        def clock_from_slot(slot_in_day):
-            """Clock time for a slot index within a day.
-
-            Takes slot-in-day rather than an absolute slot: an end-exclusive
-            boundary at the last slot of a day would otherwise wrap to 09:00
-            of the following day.
-            """
-            mins = 9 * 60 + slot_in_day * slot_minutes
-            return f"{mins // 60:02d}:{mins % 60:02d}"
-
         # Contention per window: how many *distinct* unscheduled interviews
         # could legally have started inside it. Counting every saturated slot
         # an interview could use would just re-report the global unscheduled
         # total on every window.
         window_report = []
         for w in sorted(windows, key=len, reverse=True)[:6]:
-            day = w[0] // SLOTS_PER_DAY_RAW
-            frm = clock_from_slot(w[0] % SLOTS_PER_DAY_RAW)
-            to = clock_from_slot((w[-1] % SLOTS_PER_DAY_RAW) + 1)
+            day = w[0] // self.slots_raw
+            frm = timegrid.clock(self.config, w[0] % self.slots_raw)
+            to = timegrid.clock(self.config, (w[-1] % self.slots_raw) + 1)
             window_report.append({
                 "day": day + 1,
                 "from": frm,
@@ -678,7 +746,7 @@ class SchedulingModel:
         per_day = {}
         for d in range(days):
             used = sum(
-                n for t, n in load.items() if t // SLOTS_PER_DAY_RAW == d
+                n for t, n in load.items() if t // self.slots_raw == d
             )
             per_day[d + 1] = round(100.0 * used / (n_rooms * slots_per_day), 1)
 
@@ -691,13 +759,13 @@ class SchedulingModel:
             "capacity_slot_units": capacity_slots,
             "load_ratio": round(ratio, 2),
             "max_schedulable_estimate": (
-                int(len(self.interviews) / ratio) if structural else None
+                int(len(demand) / ratio) if structural else None
             ),
             "headline": (
                 f"Instance is oversubscribed {ratio:.2f}x: {demand_slots} "
                 f"slot-units of interview demand against {capacity_slots} "
                 f"room-slot-units of capacity. No schedule can place all "
-                f"{len(self.interviews)} interviews — the shortfall is "
+                f"{len(demand)} interviews — the shortfall is "
                 f"structural, not a solver failure."
                 if structural else
                 f"Capacity is sufficient in aggregate (load {ratio:.2f}x); "
@@ -706,6 +774,21 @@ class SchedulingModel:
             "room_utilization_per_day_pct": per_day,
             "saturated_windows": window_report,
         }
+
+    def _window_label(self, w0, w1):
+        """An absolute (from, to) slot pair as a readable clock range.
+
+        End-exclusive, so a window that stops on a day boundary is reported as
+        the end of the day it actually covers rather than 00:00 of the next
+        one — the same wrap `timegrid.clock` exists to avoid.
+        """
+        d0, s0 = timegrid.split(self.config, w0)
+        d1, s1 = timegrid.split(self.config, w1)
+        if s1 == 0 and d1 > d0:
+            d1, s1 = d1 - 1, self.slots_raw
+        start = f"Day {d0 + 1} {timegrid.clock(self.config, s0)}"
+        end = f"Day {d1 + 1} {timegrid.clock(self.config, s1)}"
+        return start if start == end else f"{start}\u2009\u2013\u2009{end}"
 
     def diagnose_unscheduled(self, scheduled, unscheduled):
         """Attribute each unscheduled interview to a specific saturated resource.
@@ -814,6 +897,24 @@ class SchedulingModel:
                     f"slot where {company['name']} could still place these "
                     f"interviews."
                 )
+            elif dominant == "company_window":
+                # These never reached the solver at all: the company is
+                # unavailable for every slot a full interview would fit in.
+                # Without its own branch this fell through to the student
+                # message below and blamed the cohort for the company's
+                # absence — with the room-capacity tag attached, no less.
+                windows = company.get("unavailable_windows") or []
+                when = "; ".join(
+                    self._window_label(w0, w1) for w0, w1 in windows[:3]
+                ) or "the whole week"
+                reason = (
+                    f"{company['name']} is unavailable for every slot that "
+                    f"fits a {company['interview_minutes']}min interview "
+                    f"({when}). These {entry['count']} interview(s) have no "
+                    f"legal time left, whatever the rooms and panels are "
+                    f"doing — the cause is the company's availability, not "
+                    f"contention."
+                )
             else:
                 reason = (
                     f"Students already have interviews filling every slot "
@@ -821,6 +922,22 @@ class SchedulingModel:
                     f"(e.g. {', '.join(entry['students'])})."
                 )
 
+            if dominant == "panel_capacity":
+                tag = f"panel_capacity:{cid}"
+            elif dominant == "company_window":
+                # Recorded here rather than in build(): unplaceability is only
+                # known once a company's windows are consulted, and the
+                # diagnostics route reaches this without building the model.
+                # The tag states the CONSTRAINT; `reason` states this
+                # company's situation under it, so the two do not duplicate.
+                tag = self._tag(
+                    "company_window", cid,
+                    f"An interview may only start inside its company's "
+                    f"remaining availability; {company['name']} has no such "
+                    f"slot wide enough for {company['interview_minutes']}min.",
+                )
+            else:
+                tag = "room_capacity:global"
             report.append({
                 "company_id": cid,
                 "company": company["name"],
@@ -828,9 +945,7 @@ class SchedulingModel:
                 "demand": demand,
                 "dominant_cause": dominant,
                 "cause_breakdown": dict(entry["causes"]),
-                "constraint_tag": self.constraint_reasons.get(
-                    f"{'panel_capacity:' + cid if dominant == 'panel_capacity' else 'room_capacity:global'}"
-                ),
+                "constraint_tag": self.constraint_reasons.get(tag),
                 "reason": reason,
                 "example_students": entry["students"],
             })

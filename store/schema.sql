@@ -145,3 +145,21 @@ CREATE TABLE IF NOT EXISTS users (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_login    TIMESTAMPTZ
 );
+
+-- Pending replan proposals. A proposal is computed but NOT applied: it holds
+-- the schedule that *would* result, and only POST /replan/apply commits it.
+--
+-- This lives in the database rather than a process dict because it is the one
+-- piece of state that gates a schedule mutation. Held in memory, a proposal
+-- issued by one worker is a 404 on the next, and every pending approval is
+-- lost on restart -- while the schedule it was computed against survives.
+-- `expires_at` bounds the window: a proposal is only valid against the
+-- schedule it was built from, so a stale one must not be applicable.
+CREATE TABLE IF NOT EXISTS proposals (
+    id         TEXT PRIMARY KEY,
+    dataset    TEXT        NOT NULL,
+    payload    JSONB       NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS proposals_dataset_idx ON proposals (dataset);

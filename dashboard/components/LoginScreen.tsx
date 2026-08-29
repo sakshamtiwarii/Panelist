@@ -1,7 +1,9 @@
 "use client";
 
 import { useState } from "react";
-import { ApiError, api, type Session } from "@/lib/api";
+import {
+  API_BASE, ApiError, api, diagnoseReachability, type Session,
+} from "@/lib/api";
 
 /**
  * Sign-in gate.
@@ -44,11 +46,28 @@ export default function LoginScreen({
     try {
       onSignedIn(await api.login(username.trim(), password));
     } catch (err) {
-      setError(
-        err instanceof ApiError && err.status === 401
-          ? "Incorrect username or password."
-          : "Could not reach the API. Is it running on port 8000?",
-      );
+      if (err instanceof ApiError) {
+        setError(
+          err.status === 401
+            ? "Incorrect username or password."
+            : `The API replied ${err.status}. ${String(err.message).slice(0, 160)}`,
+        );
+      } else {
+        // No HTTP response at all. Tell a dead API apart from an origin the
+        // API refuses — the browser reports both identically, and the second
+        // is nearly always the dashboard being opened on the wrong port.
+        const why = await diagnoseReachability();
+        const origin =
+          typeof window !== "undefined" ? window.location.origin : "this page";
+        setError(
+          why === "origin-rejected"
+            ? `The API at ${API_BASE} is running but refuses requests from ` +
+              `${origin}. You are probably on the wrong port — check the ` +
+              `dashboard row of \`docker compose ps\` and open that address.`
+            : `Nothing is answering at ${API_BASE}. Start it with ` +
+              `\`docker compose up\`, then reload.`,
+        );
+      }
     } finally {
       setBusy(false);
     }

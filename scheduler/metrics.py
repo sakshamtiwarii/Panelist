@@ -15,8 +15,6 @@ metrics sacrificed first.
 
 from collections import defaultdict
 
-SLOTS_PER_DAY_RAW = 32
-
 
 def compute_metrics(scheduled, unscheduled, students, rooms, config):
     total = len(scheduled) + len(unscheduled)

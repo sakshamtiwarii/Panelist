@@ -1,7 +1,7 @@
 """
 Panelist — replan scenario regression.
 
-    python tests/test_replan_scenarios.py
+    python -m tests.test_replan_scenarios
 
 Runs every disruption type plus the compound injection against the primary
 dataset, with a mid-day lock in place, and asserts the properties that must
@@ -17,17 +17,28 @@ quietly rewrites the morning looks fine in every headline metric.
 
 import json
 import os
-import sys
 import time
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
+from replanner.replan import replan
+from replanner.run import build_scenarios
 
-from replanner.replan import replan  # noqa: E402
-from replanner.run import build_scenarios  # noqa: E402
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 NOW_SLOT = 48  # mid Day 2
-DATA = os.path.join(ROOT, "data", "primary")
+DATA = os.environ.get("PANELIST_REPLAN_DATA",
+                      os.path.join(ROOT, "data", "primary"))
+
+# CP-SAT runs 8 workers in parallel, so its *wall-clock* limit makes solve time
+# nondeterministic: the compound scenario has been measured between 16s and 37s
+# on identical input. This suite asserts correctness properties (no clashes,
+# hard constraints hold, locks respected), never solver speed, so the budget is
+# set well clear of the observed worst case. A tighter one makes a *different*
+# scenario fail on each run, which reads like a real regression and is not one.
+#
+# Overridable because the headroom needed scales with the machine: a 2-core CI
+# runner gives the solver a quarter of the workers a dev laptop does, so CI
+# raises this rather than inheriting a budget tuned on faster hardware.
+TIME_LIMIT = float(os.environ.get("PANELIST_REPLAN_TIME_LIMIT", 120))
 
 
 def main():
@@ -49,7 +60,7 @@ def main():
     for name in ("late", "panel", "withdraw", "room", "compound"):
         t0 = time.time()
         p = replan(dataset, prior, scenarios[name], churn_cap_pct=10,
-                   time_limit_seconds=45, now_slot=NOW_SLOT)
+                   time_limit_seconds=TIME_LIMIT, now_slot=NOW_SLOT)
         if not p["ok"]:
             print(f"{name:<10} FAILED: {p['reason'][:60]}")
             failures.append(name)

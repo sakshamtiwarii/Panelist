@@ -19,15 +19,32 @@ little as possible.
 ```
 generator/    seeded, realistic dataset generation (companies, students, rooms)
 scheduler/    CP-SAT model: hard constraints + infeasibility diagnostics
+  timegrid.py the slot grid, read from a dataset's config
 replanner/    disruption handling: warm-started re-solve, minimal-churn diff
 store/        Postgres persistence: versioned schedules + replan audit trail
 api/          FastAPI endpoints wrapping generator/scheduler/replanner
+  deps.py     the store and the live-dataset accessors
+  schemas.py  request bodies
+  routes/     auth · schedule · roster · replan
 dashboard/    Next.js coordinator UI: schedule view, disruption triggers, diff viewer
 ```
+
+Dependencies run one way — `generator` and `store` depend on nothing internal,
+`scheduler` on nothing but itself, `replanner` on `scheduler`, `api` on all of
+them, and `dashboard` talks HTTP only. Everything installs as one package
+(`pip install -e .`), so imports resolve by their real dotted names rather than
+by patching `sys.path` at import time.
 
 `scheduler/model.py` is shared by both the initial scheduler and the
 replanner — the replanner calls it with `prior_schedule` set and a churn
 penalty weight, rather than duplicating constraint logic.
+
+**The time grid has one source.** The generator decides the working day and
+writes the whole model — slot length, day origin, lunch, raw slots per day —
+into the dataset's `config`; every other module reads it back through
+`scheduler/timegrid.py`. A private copy of `SLOTS_PER_DAY_RAW = 32` cannot fail
+loudly, only quietly: nothing crashes, every appointment just renders at the
+wrong clock time.
 
 ## Signing in
 
@@ -131,6 +148,22 @@ docker compose up
 - Dashboard: http://localhost:3000
 - Postgres: localhost:55432
 
+**Check the port before you open it.** Those are the defaults; if any was
+already taken on your machine, Docker published elsewhere and the URL above is
+wrong for you. `docker compose ps` is authoritative — the `dashboard` row shows
+the host port on the left of `->3000`:
+
+```
+dashboard   running   0.0.0.0:3001->3000/tcp     # open :3001, not :3000
+```
+
+The API allows requests from exactly the origin it published the dashboard on,
+so opening the wrong port fails every fetch with a CORS error rather than a
+404 — the console detects this case and says so, but it is worth knowing.
+
+These are the defaults; if you have a `.env` with port overrides (see below),
+use the ports it sets instead.
+
 Then `POST /schedule` (or press **Build schedule** in the dashboard) to solve.
 A fresh clone has no dataset — `data/` is gitignored — so run the generator
 first, or `POST /generate`.
@@ -154,19 +187,61 @@ published port exists only for host tooling like `psql`.
 Running without Docker:
 
 ```bash
+pip install -e .                          # from the repo root, once
 createdb panelist
 export DATABASE_URL="postgresql://$USER@127.0.0.1:5432/panelist"
-uvicorn main:app --port 8000              # from api/
+uvicorn api.main:app --port 8000          # from the repo root
 npm run dev                               # from dashboard/
 ```
+
+The project installs as a package, so `api.main`, `scheduler.model` and the
+rest resolve by their real dotted names in every context — container, bare
+checkout, and test run alike. The CLIs are module entry points for the same
+reason: use `python -m scheduler.run`, not `python scheduler/run.py`.
 
 The schema is created automatically on first connect. Omit `DATABASE_URL`
 entirely and everything still runs, in memory.
 
+## Tests
+
+```bash
+pip install -e ".[dev]"
+pytest tests/test_api.py              # ~3s, generates its own dataset
+pytest tests/test_store_parity.py     # ~1s, both stores
+python -m tests.test_replan_scenarios # ~3.5min, every disruption type
+ruff check .
+```
+
+`tests/test_store_parity.py` runs every case against **both** stores and
+asserts the same outcome. The in-memory fallback exists so the app survives an
+unreachable database, which means any behavioural difference between the two
+surfaces as a bug that appears only when the database is down — or only when it
+is up. It found one: `/schedule/versions` was returning a different order *and
+a different shape* depending on which store was active. Point
+`PANELIST_TEST_DATABASE_URL` at a server to include the Postgres half; without
+it, only the memory half runs.
+
+`tests/test_api.py` covers the boundaries the scenario suite cannot reach:
+authentication, the coordinator/viewer split, and the propose → apply
+handshake. It generates its own dataset rather than reading `data/`, which is
+gitignored, so it runs on a fresh clone.
+
+`tests/test_replan_scenarios.py` runs every disruption type plus the compound
+injection against the primary dataset with a mid-day lock, and asserts what
+must hold whatever the solver decides: zero student clashes (recomputed
+independently), the model's own hard-constraint verification, and that
+interviews already under way are neither moved nor cancelled.
+
+All of these run in CI (`.github/workflows/ci.yml`), which stands up a Postgres
+service for the parity suite and runs the replan scenarios as their own job
+with a larger solver budget — a CI runner has fewer cores than a dev machine,
+so the solver needs more wall-clock for the same result
+(`PANELIST_REPLAN_TIME_LIMIT`).
+
 To regenerate the dataset with a different seed/size:
 
 ```bash
-python generator/generate.py --seed 42 --companies 35 --students 800 --rooms 20 --days 4
+python -m generator.generate --seed 42 --companies 35 --students 800 --rooms 20 --days 4
 ```
 
 ## Design decisions (defended)
@@ -180,14 +255,42 @@ off against each other, zero clashes and cutoff compliance win first.
 **When infeasible, which constraint bends first?**
 CGPA cutoffs and no-double-booking constraints are never violated — they're
 business rules and safety constraints. Exact time-slot placement is the
-soft constraint that shifts first. If that's still not enough, the choice
-is surfaced to the coordinator via priority-tier override rather than
-silently decided by the algorithm.
+soft constraint that shifts first. When even that isn't enough and some
+interviews must go unplaced, the algorithm's default is the tier order: a
+tier-1 mass recruiter is protected ahead of a tier-3 niche company.
+
+That default is a policy decision, so it is overridable. `priority_overrides`
+on `POST /schedule` and `POST /replan` — and the **Priority overrides** panel
+in the console — let a coordinator *protect* a company above the tier order or
+*drop it first* below it. Protection outranks any tier difference and any
+churn penalty, so a protected company is kept even when keeping it forces a
+reshuffle; dropping first leaves a weight of 1 rather than 0, so the company
+still fills spare capacity instead of being excluded outright. An override
+naming a company the dataset doesn't have is refused rather than ignored,
+because silently discarding it would leave the coordinator believing they had
+acted.
+
+The division is the point: the algorithm decides the default, the coordinator
+decides the exceptions, and neither silently overrules the other.
+
+On a 316-interview instance oversubscribed 3x, the default drops one tier-3
+company entirely (0 of 17 placed). Protecting it places 9 of 17 — and costs 26
+interviews elsewhere. That trade is the coordinator's to make, and the console
+shows both numbers before it is made.
 
 **How much reshuffling is acceptable during a replan?**
 Churn is capped (default 10% of the day's appointments, configurable). If a
 fix requires exceeding that, it's surfaced to the coordinator to confirm or
 request a looser fix — never auto-applied silently.
+
+The looser fix is real, not a promise: exceeding the cap triggers a second
+solve at a 40x stability weight, and when that finds a meaningfully cheaper
+schedule both are returned and either can be committed
+(`POST /replan/apply {"use_alternative": true}`). The console shows them side
+by side with the trade stated — one measured example: 13 interviews moved
+leaving 6 unplaced, against 10 moved leaving 10 unplaced. When re-solving
+finds nothing cheaper the replanner says so explicitly (`churn_irreducible`)
+rather than offering a choice that isn't one.
 
 ## Datasets
 
@@ -207,7 +310,7 @@ company pairs.
 ## Solver results
 
 ```bash
-python scheduler/run.py --data ./data/primary --time-limit 30
+python -m scheduler.run --data ./data/primary --time-limit 30
 ```
 
 | Dataset | Interviews | Status | Time | Scheduled | Clashes | Room util |
@@ -236,8 +339,8 @@ schedule plus an attributed shortfall, rather than a bare INFEASIBLE.
 ## Replanning
 
 ```bash
-python replanner/run.py --data ./data/primary --scenario compound
-python replanner/run.py --data ./data/primary --scenario room --now-slot 48
+python -m replanner.run --data ./data/primary --scenario compound
+python -m replanner.run --data ./data/primary --scenario room --now-slot 48
 ```
 
 Scenarios (`late`, `panel`, `withdraw`, `room`, `compound`) are derived from
@@ -282,9 +385,11 @@ company, student) · `GET /metrics` · `GET /diagnostics` · `GET /affected` ·
 
 - **Generator** — done. Seeded, reproducible, with conflict-density readout.
 - **Scheduler** — done. CP-SAT model, metrics, capacity diagnostics,
-  independent verification.
+  independent verification, and coordinator priority overrides on top of the
+  tier default.
 - **Replanner** — done. Four disruption types, compound events, minimal-churn
-  re-solve, structured diff, notify list, churn cap with authorization flow.
+  re-solve, structured diff, notify list, churn cap with authorization flow,
+  and a lower-churn alternative the coordinator can commit instead.
 - **API** — done. Propose/apply separation verified end to end.
 - **Persistence** — done. Postgres-backed versioned schedules, impact queries
   and replan audit trail, with an in-memory fallback.
