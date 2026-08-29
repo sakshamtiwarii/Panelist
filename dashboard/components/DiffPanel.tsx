@@ -3,16 +3,16 @@
 import { useState } from "react";
 import type { ChangeDetail, Proposal } from "@/lib/api";
 import type { Clock } from "@/lib/time";
+import Icon from "./Icon";
 
 /**
  * The proposal review surface — the only place the schedule can change.
  *
- * Two things drive the layout. First, churn is shown against the cap as a bar
- * before any list of changes, because "is this fix proportionate" is the
- * question being asked and a number in a paragraph doesn't answer it fast
- * enough. Second, forced and elective churn are visually separated: the
- * coordinator did not choose the cancellations a withdrawal caused, and
- * blending them into one figure makes a modest fix look reckless.
+ * Churn is shown against the cap as a headline number and a bar before any list
+ * of changes, since "is this fix proportionate" is the question being asked.
+ * Forced and elective churn stay visually separate: the coordinator did not
+ * choose the cancellations a withdrawal caused, and one blended figure makes a
+ * modest fix look reckless.
  */
 
 interface Props {
@@ -37,12 +37,15 @@ export default function DiffPanel({
     return (
       <aside className="diff">
         <div className="diff-head">
-          <span className="label">Replan failed</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <Icon name="alert" size={15} style={{ color: "var(--st-cut)" }} />
+            <span className="label" style={{ color: "var(--st-cut)" }}>Replan failed</span>
+          </div>
         </div>
         <div style={{ padding: 14 }}>
           <div className="callout err">{proposal.reason}</div>
           {proposal.lock_conflicts?.length ? (
-            <ul style={{ margin: "12px 0 0", paddingLeft: 16, fontSize: 11.5 }}>
+            <ul style={{ margin: "12px 0 0", paddingLeft: 16, fontSize: 12 }}>
               {proposal.lock_conflicts.map((c, i) => (
                 <li key={i} style={{ marginBottom: 6 }}>{c}</li>
               ))}
@@ -59,8 +62,8 @@ export default function DiffPanel({
   const cap = proposal.churn_cap_pct ?? 10;
   const pct = d.elective_churn_pct;
   const over = !!proposal.cap_exceeded;
-  // Only offered when re-solving actually found a meaningfully cheaper fix;
-  // when the churn is irreducible the replanner says so instead.
+  // Present only when re-solving found a meaningfully cheaper fix; otherwise
+  // the replanner reports the churn as irreducible.
   const alt = proposal.alternative ?? null;
   const unplaced = proposal.unscheduled ?? 0;
   // Scale so the cap marker sits at a readable position even for tiny churn.
@@ -86,11 +89,12 @@ export default function DiffPanel({
   return (
     <aside className="diff">
       <div className="diff-head">
-        <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
-          <span className="label">{proposal.label ?? "Proposal"}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span className="swatch moved" />
+          <span className="label">{proposal.label ?? "Proposed fix"}</span>
           <span className="spacer" />
-          <span className="num" style={{ fontSize: 11.5, color: "var(--ink-3)" }}>
-            {proposal.solver?.wall_time_seconds}s
+          <span className="num" style={{ fontSize: 11, color: "var(--ink-3)" }}>
+            solved in {proposal.solver?.wall_time_seconds}s
           </span>
         </div>
 
@@ -105,23 +109,29 @@ export default function DiffPanel({
           )}
         </p>
 
-        <div style={{ display: "flex", alignItems: "baseline", gap: 6, marginTop: 10 }}>
-          <span className="num" style={{ fontSize: 26, letterSpacing: "-0.025em" }}>
+        {/* Proportional figures, not tabular: at 40px tabular digits read
+            visibly loose. */}
+        <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+          <span className={`hero-n${over ? " over" : ""}`}>
             {d.elective_churn_count}
           </span>
           <span style={{ fontSize: 12.5, color: "var(--ink-2)" }}>
-            of {d.baseline_appointments} appointments
+            of {d.baseline_appointments}<br />appointments moved
           </span>
         </div>
 
-        <div className="churn-bar">
+        <div className={`churn-bar${over ? " over" : ""}`}>
           <div
             className={`churn-fill${over ? " over" : ""}`}
             style={{ width: `${Math.min(100, (pct / scaleMax) * 100)}%` }}
           />
-          <div className="churn-cap" style={{ left: `${(cap / scaleMax) * 100}%` }} />
+          <div
+            className="churn-cap"
+            style={{ left: `${(cap / scaleMax) * 100}%` }}
+            title={`Your limit: ${cap}%`}
+          />
         </div>
-        <div style={{ display: "flex", fontSize: 11.5, color: "var(--ink-3)" }}>
+        <div style={{ display: "flex", fontSize: 11, color: "var(--ink-3)" }}>
           <span className="num">{pct}% changed</span>
           <span className="spacer" />
           <span className="num">your limit {cap}%</span>
@@ -145,12 +155,12 @@ export default function DiffPanel({
             <div className="alt-compare">
               <div>
                 <span className="label">This fix</span>
-                <div className="alt-n num">{d.elective_churn_count} moved</div>
+                <div className="alt-n">{d.elective_churn_count} moved</div>
                 <div className="alt-sub">{unplaced} left unplaced</div>
               </div>
               <div>
                 <span className="label">Alternative</span>
-                <div className="alt-n num">{alt.elective_churn_count} moved</div>
+                <div className="alt-n">{alt.elective_churn_count} moved</div>
                 <div className="alt-sub">{alt.unscheduled} left unplaced</div>
               </div>
             </div>
@@ -169,7 +179,7 @@ export default function DiffPanel({
           </div>
         )}
         {!canApply && (
-          <div className="callout">
+          <div className="callout info">
             You are signed in as a viewer. You can review this proposal in full,
             but applying it changes the live schedule and needs a coordinator
             account.
@@ -188,14 +198,13 @@ export default function DiffPanel({
           <section className="diff-group" key={g.key}>
             <button
               className="diff-group-head"
+              aria-expanded={!!open[g.key]}
               onClick={() => setOpen((o) => ({ ...o, [g.key]: !o[g.key] }))}
             >
               <span className={`swatch ${g.swatch}`} />
               <span style={{ fontSize: 13, fontWeight: 560 }}>{g.label}</span>
               <span className="n">{g.items.length}</span>
-              <span style={{ color: "var(--ink-3)", fontSize: 10 }}>
-                {open[g.key] ? "▾" : "▸"}
-              </span>
+              <Icon name="chevron" size={13} className="chev" />
             </button>
             {open[g.key] &&
               g.items.slice(0, 60).map((item) => (
@@ -236,21 +245,21 @@ export default function DiffPanel({
           </section>
         ))}
 
-        {proposal.notify && (
+        {proposal.notify && proposal.notify.total_people_to_contact > 0 && (
           <section className="diff-group">
             <button
               className="diff-group-head"
+              aria-expanded={!!open.notify}
               onClick={() => setOpen((o) => ({ ...o, notify: !o.notify }))}
             >
+              <Icon name="alert" size={13} style={{ color: "var(--ink-3)" }} />
               <span style={{ fontSize: 13, fontWeight: 560 }}>
                 Who needs telling
               </span>
               <span className="n">
                 {proposal.notify.total_people_to_contact}
               </span>
-              <span style={{ color: "var(--ink-3)", fontSize: 10 }}>
-                {open.notify ? "▾" : "▸"}
-              </span>
+              <Icon name="chevron" size={13} className="chev" />
             </button>
             {open.notify &&
               proposal.notify.students.slice(0, 40).map((s) => (
@@ -276,7 +285,9 @@ export default function DiffPanel({
             ? "Applying a fix changes the live schedule and needs a coordinator account"
             : undefined}
         >
-          {applying ? "Applying…" : over ? "Apply anyway" : "Apply this fix"}
+          {applying
+            ? <><span className="spinner" />Applying…</>
+            : over ? "Apply anyway" : "Apply this fix"}
         </button>
         {alt && (
           <button

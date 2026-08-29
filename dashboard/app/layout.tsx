@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -7,23 +7,32 @@ export const metadata: Metadata = {
 };
 
 /**
- * Applies the saved theme before first paint.
- *
- * Without this the theme is only set in an effect, which runs after hydration —
- * so a coordinator who picked dark gets a white flash on every load. Reading
- * localStorage in a blocking script in <head> stamps the root element before
- * the browser paints anything.
- *
- * It also means <html> is modified before React hydrates, which is why <html>
- * carries suppressHydrationWarning below.
+ * Two theme-colors so the browser chrome matches the page in both modes. The
+ * values are the light and dark `--surface`, which paints the top bar.
  */
-const THEME_SCRIPT = `
+export const viewport: Viewport = {
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#ffffff" },
+    { media: "(prefers-color-scheme: dark)", color: "#18181b" },
+  ],
+};
+
+/**
+ * Applies the saved display preferences before first paint.
+ *
+ * Set in an effect instead, they would land after hydration: a white flash for
+ * anyone on dark, a reflow for anyone on a compact board. A blocking script in
+ * <head> stamps the root element first. The page does not touch these
+ * attributes until it has read the same keys back.
+ */
+const PREFS_SCRIPT = `
 (function () {
   try {
+    var d = document.documentElement;
     var t = localStorage.getItem("panelist-theme");
-    if (t === "light" || t === "dark") {
-      document.documentElement.setAttribute("data-theme", t);
-    }
+    if (t === "light" || t === "dark") d.setAttribute("data-theme", t);
+    var n = localStorage.getItem("panelist-density");
+    if (n === "compact" || n === "comfortable") d.setAttribute("data-density", n);
   } catch (e) { /* private mode: fall through to the OS setting */ }
 })();
 `;
@@ -34,16 +43,13 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    // suppressHydrationWarning is required on both elements, and only silences
-    // attribute mismatches one level deep:
-    //   <html> — the theme script above stamps data-theme pre-hydration.
-    //   <body> — browser extensions (Grammarly, password managers) inject
-    //            their own attributes before React loads. That mismatch is
-    //            the extension's, not the app's, and there is no way to
-    //            prevent it from inside the page.
+    // suppressHydrationWarning silences attribute mismatches one level deep,
+    // and both elements have one: <html> is stamped by the script above before
+    // hydration, and <body> is where browser extensions inject their own
+    // attributes before React loads.
     <html lang="en" suppressHydrationWarning>
       <head>
-        <script dangerouslySetInnerHTML={{ __html: THEME_SCRIPT }} />
+        <script dangerouslySetInnerHTML={{ __html: PREFS_SCRIPT }} />
       </head>
       <body suppressHydrationWarning>{children}</body>
     </html>

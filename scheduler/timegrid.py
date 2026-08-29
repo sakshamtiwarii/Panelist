@@ -1,21 +1,12 @@
-"""
-Panelist — the time grid, read from a dataset's config.
+"""The time grid, read from a dataset's config.
 
-The day boundaries are decided once, by the generator, and written into
-`config`. Every other module reads them back from here rather than keeping a
-private copy, because a stale `SLOTS_PER_DAY_RAW = 32` in the solver cannot
-fail loudly — nothing crashes, every appointment simply renders at the wrong
-clock time. Generate a dataset over 08:00-18:00 and a hardcoded copy still
-believes 32 slots from 09:00.
+Day boundaries are decided once by the generator and written into `config`.
+Every other module reads them back from here rather than keeping a private
+copy — a stale constant would not crash anything, it would just render every
+appointment at the wrong clock time.
 
-This module deliberately depends on nothing. The generator owns what the time
-model *is*; everything downstream only reads it back.
-
-A dataset generated before these keys existed raises rather than falling back
-to the old 32/09:00 defaults. Substituting a default here would reintroduce
-exactly the failure this module removes: nothing crashes, and every appointment
-quietly renders at the wrong clock time. Regenerating the dataset is a second's
-work; a schedule that is subtly wrong is not detectable at all.
+For the same reason a config missing these keys raises instead of falling back
+to a default. This module depends on nothing else.
 """
 
 
@@ -30,7 +21,6 @@ def _require(config, key):
         ) from None
 
 
-# Every key the time model needs. Kept beside _require so the two cannot drift.
 REQUIRED_KEYS = (
     "days", "slot_minutes", "usable_slots_per_day",
     "slots_per_day_count", "slots_per_day_raw", "day_start_minutes",
@@ -40,10 +30,8 @@ REQUIRED_KEYS = (
 def missing_keys(config):
     """Which time-model keys a config lacks — empty tuple if it is usable.
 
-    Lets a caller test a config BEFORE building anything from it. Without this
-    the only way to discover a stale dataset is to hit the KeyError at request
-    time, which surfaces as a 500 on whichever endpoint happens to touch the
-    grid first.
+    Lets a caller test a config before building anything from it, rather than
+    discovering a stale dataset as a 500 at request time.
     """
     return tuple(k for k in REQUIRED_KEYS if k not in (config or {}))
 
@@ -86,12 +74,7 @@ def clock(config, slot_in_day):
 
 
 def stamp(config, day, slot_in_day):
-    """'Day 2 12:00' — how a coordinator reads a moment.
-
-    Lives here because four modules were each building this string from
-    `clock()` by hand, and a raw slot index is not something anyone can check
-    against a clock on the wall.
-    """
+    """'Day 2 12:00' — how a coordinator reads a moment."""
     return f"Day {day + 1} {clock(config, slot_in_day)}"
 
 
@@ -101,12 +84,5 @@ def stamp_absolute(config, absolute_slot):
 
 
 def overlaps(a0, a1, b0, b1):
-    """Do the half-open slot ranges [a0, a1) and [b0, b1) intersect?
-
-    The codebase's most-repeated test, and it had been written three different
-    ways — `a < w1 and b > w0`, `not (hi <= b0 or lo >= b1)`, and inline
-    variants. They agree, but only if every inequality is right in every copy,
-    and an interval test that is wrong by one sign fails silently: interviews
-    land in blocked rooms and nothing raises.
-    """
+    """Do the half-open slot ranges [a0, a1) and [b0, b1) intersect?"""
     return a0 < b1 and a1 > b0

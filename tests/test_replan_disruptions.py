@@ -1,17 +1,14 @@
-"""
-Panelist — a disruption must never dead-end the coordinator.
+"""A disruption must never dead-end the coordinator.
 
-The replanner's contract is that any event a coordinator can express gets an
-answer: a proposal, or a named reason it is impossible. A bare INFEASIBLE is
-neither — it tells them the week cannot be saved when the truth is usually
-that one company cannot interview for the rest of the day.
+Every event a coordinator can express gets an answer: a proposal, or a named
+reason it is impossible. A bare INFEASIBLE is neither — it says the week cannot
+be saved when the truth is usually that one company cannot interview for the
+rest of the day.
 
-`panel_drop` broke that contract twice. Each blackout is a fixed interval
-against a Cumulative of capacity `panel_count`, so asking a one-panel company
-to stand down three panels wrote three intervals into a model that could hold
-one, and the whole week came back INFEASIBLE. Laying a blackout over an hour
-the company had already interviewed in did the same, and the lock validator
-did not catch it because it only compared against `panel_count`.
+`panel_drop` is the sharp case. Each blackout is a fixed interval against a
+Cumulative of capacity `panel_count`, so standing down more panels than a
+company has, or laying a blackout over an hour it has already interviewed in,
+must be caught before it reaches the solver as an infeasibility.
 """
 
 import copy

@@ -1,17 +1,11 @@
-# Production image for the coordinator console.
-#
-# It used to install dependencies and run `next dev`, which was fine while the
-# only consumer was docker-compose (which overrides the command with its own
-# `npm run dev` for hot reload). A hosted deployment builds this same file and
-# got the dev server on a hardcoded port 3000 — so it ignored the platform's
-# assigned $PORT and every request returned 502 with a healthy-looking build.
+# Production image for the coordinator console. docker-compose overrides the
+# command with `npm run dev` for hot reload.
 FROM node:22-alpine
 
 WORKDIR /app
 
 # Dependencies first so editing source does not reinstall them. `npm ci`
-# rather than `npm install`: it installs exactly the lockfile, which is what
-# makes a deployed build reproducible.
+# installs exactly the lockfile, which keeps a deployed build reproducible.
 COPY package.json package-lock.json* ./
 RUN npm ci
 

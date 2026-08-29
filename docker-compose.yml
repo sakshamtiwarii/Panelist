@@ -6,20 +6,18 @@ services:
       POSTGRES_PASSWORD: panelist
       POSTGRES_DB: panelist
     ports:
-      # Published high and overridable because developer machines routinely
-      # already run Postgres — 5432 and 5433 are both commonly taken, and
-      # Docker publishes on 0.0.0.0, so it collides with any instance bound to
-      # all interfaces even when localhost-only tools report the port free.
-      # The API reaches the database as db:5432 on the compose network
-      # regardless; this mapping exists only for host tooling like psql.
-      # Override with: PANELIST_DB_PORT=5599 docker compose up
+      # Published high and overridable: dev machines routinely already run
+      # Postgres, and Docker publishes on 0.0.0.0 so it collides with any
+      # instance bound to all interfaces. The API reaches the database as
+      # db:5432 on the compose network regardless — this mapping is only for
+      # host tooling like psql. PANELIST_DB_PORT=5599 docker compose up
       - "${PANELIST_DB_PORT:-55432}:5432"
     volumes:
       - panelist_db_data:/var/lib/postgresql/data
     healthcheck:
-      # depends_on alone only waits for the CONTAINER to start, not for
-      # Postgres to accept connections — the API wins that race on a cold
-      # start and silently falls back to its in-memory store.
+      # depends_on alone waits for the container, not for Postgres to accept
+      # connections — the API wins that race on a cold start and falls back to
+      # its in-memory store.
       test: ["CMD-SHELL", "pg_isready -U panelist -d panelist"]
       interval: 2s
       timeout: 3s
@@ -34,12 +32,8 @@ services:
       dockerfile: api/Dockerfile
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
     volumes:
-      # One mount of the repo, matching the image layout. The five separate
-      # mounts this replaces had to recreate the package tree by hand, and left
-      # empty api/scheduler, api/store ... directories in the checkout that
-      # looked like real source. Datasets are generated artefacts and
-      # gitignored, so this also means POST /generate writes somewhere that
-      # survives the container.
+      # One mount of the repo, matching the image layout, so POST /generate
+      # writes datasets somewhere that survives the container.
       - .:/app
       # Keep the image's editable install; the bind mount above would otherwise
       # hide it behind the host directory.
@@ -75,10 +69,8 @@ services:
       - "${PANELIST_WEB_PORT:-3000}:3000"
     environment:
       # Resolved inside the container, not in the browser: the dashboard
-      # forwards /api/* to the solver over the compose network, so the page
-      # and the API share one origin. That removes the whole class of "opened
-      # the wrong published port and every fetch fails CORS" problems — the
-      # browser never learns the API's address at all.
+      # forwards /api/* to the solver over the compose network, so the page and
+      # the API share one origin and the browser never learns the API's address.
       PANELIST_API_ORIGIN: http://api:8000
     depends_on:
       - api

@@ -1,32 +1,22 @@
-"""
-Panelist — replanner.
+"""Replanner: resolve disruptions to a live schedule with minimal disturbance.
 
-Takes an existing schedule + one or more disruption events and produces a new
-schedule that resolves them with minimal disturbance (guide section 2.3, "the
-heart of the assignment").
-
-Disruption types (minimum, per assignment spec):
+Disruption types:
 - company_late:      company arrives N hours late on a given day
 - panel_drop:        a panel drops out
 - student_withdraw:  a student withdraws
 - room_unavailable:  a room becomes unavailable
+plus the roster amendments company_add / company_remove / shortlist_add /
+shortlist_remove.
 
-Design stance
--------------
-A replan is the SAME CP-SAT model as the initial solve, re-run with
+A replan is the same CP-SAT model as the initial solve, re-run with
 `prior_schedule` set and a churn penalty in the objective, warm-started from
-the existing schedule. No solver logic is duplicated here (guide section 8) —
-this module only translates disruption events into problem-input changes, then
-turns the two schedules into a diff a coordinator can act on.
+the existing schedule. This module only translates disruption events into
+problem-input changes and turns the two schedules into an actionable diff.
 
-Nothing is auto-applied. `replan()` returns a proposal; committing it is a
-separate, explicit step (guide section 6, "don't auto-apply replans").
-
-Churn is capped (default 10% of the prior day's appointments). When a fix
-needs more than that, the replanner does not silently take it and does not
-simply fail — it re-solves with a much heavier churn penalty and hands the
-coordinator both options, which is exactly the "confirm or let me search for a
-looser fix" flow guide section 4 asks for.
+Nothing is auto-applied: `replan()` returns a proposal, and `apply_proposal()`
+commits it. Churn is capped (default 10% of the prior day's appointments);
+a fix needing more is re-solved under a much heavier churn penalty so the
+coordinator gets both options.
 """
 
 import copy
@@ -35,8 +25,8 @@ from scheduler import timegrid
 from scheduler.metrics import compute_churn
 from scheduler.model import SchedulingModel, panels_available
 
-# Churn weight for the first attempt: light enough that the solver will still
-# reshuffle to keep interviews scheduled, heavy enough to prefer stability.
+# Light enough that the solver still reshuffles to keep interviews scheduled,
+# heavy enough to prefer stability.
 DEFAULT_CHURN_WEIGHT = 4
 # Used for the "looser fix" retry when the first proposal blows the cap.
 STABILITY_CHURN_WEIGHT = 40
@@ -51,13 +41,11 @@ class DisruptionError(ValueError):
 def apply_disruption(dataset, disruption, prior_schedule, now_slot=None):
     """Translate one disruption into changes to the problem input.
 
-    Returns (description, dropped_interview_ids). The dropped ids are the
-    interviews the disruption itself removes -- a withdrawing student's, say.
-    Those are a direct consequence of the event, not a choice the solver made,
-    so churn accounting must not charge them against the coordinator's cap.
+    Returns (description, dropped_interview_ids). The dropped ids are what the
+    disruption itself removes -- a withdrawing student's interviews, say -- so
+    churn accounting must not charge them against the coordinator's cap.
 
-    `dataset` is mutated in place, so callers wanting to keep the original must
-    copy it first (`replan` does).
+    `dataset` is mutated in place; `replan` copies before calling.
     """
     kind = disruption.get("type")
     companies = {c["id"]: c for c in dataset["companies"]}
@@ -73,9 +61,8 @@ def apply_disruption(dataset, disruption, prior_schedule, now_slot=None):
         hours = disruption["hours"]
         slots_late = round(hours * 60 / slot_minutes)
         day_start = timegrid.absolute(dataset["config"], day, 0)
-        # Blocks only the delayed part of THAT day. A watermark would forbid
-        # every earlier day as well and drag unrelated interviews across the
-        # week; several lateness events on different days stack as windows.
+        # Blocks only the delayed part of that day; lateness events on
+        # different days stack as separate windows.
         company.setdefault("unavailable_windows", []).append(
             (day_start, day_start + slots_late)
         )
@@ -105,16 +92,13 @@ def apply_disruption(dataset, disruption, prior_schedule, now_slot=None):
             )
 
         # A panel that walks out at 14:00 does not retroactively un-run the
-        # interviews it held at 10:00. Model the loss as a blackout consuming
-        # capacity from that moment on, exactly as a blocked room does, rather
-        # than lowering the count for the entire week.
+        # interviews it held at 10:00, so the loss is a blackout consuming
+        # capacity from that moment on rather than a lower week-wide count.
         #
-        # Clamped to the panels that are actually still running. Each blackout
-        # is a fixed interval against a Cumulative of capacity `panel_count`,
-        # so writing more of them than there are panels does not over-drop the
-        # company — it makes the whole model INFEASIBLE, and the coordinator
-        # gets "no valid schedule exists" for the perfectly ordinary act of
-        # standing a small company's interviewers down.
+        # Clamped to the panels still running: each blackout is a fixed
+        # interval against a Cumulative of capacity `panel_count`, so writing
+        # more of them than there are panels makes the model INFEASIBLE rather
+        # than over-dropping the company.
         existing = company.setdefault("panel_blackouts", [])
         already_out = sum(1 for _w0, w1 in existing if w1 > from_slot)
         available = max(0, company["panel_count"] - already_out)
@@ -168,12 +152,9 @@ def apply_disruption(dataset, disruption, prior_schedule, now_slot=None):
         )
 
     # --- roster amendments -------------------------------------------------
-    # Adding or removing a company is not a database write, it is a schedule-
-    # invalidating change: new interviews need slots that are already taken,
-    # and a departing company frees capacity the plan does not know how to use.
-    # Routing them through the same propose/diff/apply path as disruptions
-    # means a roster edit is costed and approved rather than silently leaving
-    # the live schedule wrong.
+    # A roster edit invalidates the schedule just as a disruption does, so it
+    # goes through the same propose/diff/apply path and is costed and approved
+    # rather than left to silently make the live schedule wrong.
 
     if kind == "company_add":
         return _add_company(dataset, disruption)
@@ -202,8 +183,6 @@ def apply_disruption(dataset, disruption, prior_schedule, now_slot=None):
         if sid not in students:
             raise DisruptionError(f"unknown student {sid!r}")
         company, student = companies[cid], students[sid]
-        # The CGPA cutoff is a business rule, not a preference: an ineligible
-        # student is refused here rather than quietly scheduled.
         if student["cgpa"] < company["cgpa_cutoff"]:
             raise DisruptionError(
                 f"{sid} has CGPA {student['cgpa']}, below {company['name']}'s "
@@ -240,9 +219,8 @@ def apply_disruption(dataset, disruption, prior_schedule, now_slot=None):
 def _add_company(dataset, spec):
     """Register a company that arrived after the dataset was generated.
 
-    The shortlist may be given explicitly, or a size may be given and the
-    eligible students picked by CGPA — which is what a late registration
-    actually looks like: "we want twenty, cutoff 8.5".
+    The shortlist may be given explicitly, or a size given and the eligible
+    students picked by CGPA.
     """
     companies = {c["id"]: c for c in dataset["companies"]}
     students = {s["id"]: s for s in dataset["students"]}
@@ -280,9 +258,6 @@ def _add_company(dataset, spec):
                 f"{cutoff} cutoff (e.g. {below[0]})")
         shortlist = list(explicit)
     else:
-        # Ranked by CGPA, which is what a late registration actually asks for:
-        # "we want twenty, cutoff 8.5". Built here rather than above because
-        # an explicit shortlist never consults it.
         eligible = sorted(
             (s for s in dataset["students"] if s["cgpa"] >= cutoff),
             key=lambda s: -s["cgpa"],
@@ -323,11 +298,8 @@ def _withdraw_student(dataset, prior_schedule, sid, scope, from_slot,
                       now_slot=None):
     """Remove a withdrawing student's interviews.
 
-    Guide section 11 calls this out specifically: a student who accepts a
-    mid-day offer is done for the DAY, so every remaining interview that day
-    must be cancelled — not only the one the event happens to reference.
-    Cancelling a single slot looks fine in a simple test and is wrong the
-    moment anyone asks what happened to their other three interviews.
+    A student who accepts a mid-day offer is done for the whole day, not just
+    the interview the event references.
 
     scope="day"  -> drop their remaining interviews from `from_slot` to the
                     end of that day; interviews on later days survive.
@@ -369,9 +341,7 @@ def _withdraw_student(dataset, prior_schedule, sid, scope, from_slot,
     day_end = timegrid.absolute(dataset["config"], day + 1, 0)
 
     # A withdrawal cancels what is still ahead of the student, never what has
-    # already been sat. Without this clamp a mid-day offer retroactively
-    # un-runs the morning's completed interviews -- which the lock check
-    # catches as a contradiction, but which is really a modelling error here.
+    # already been sat.
     effective_from = from_slot
     if now_slot is not None:
         effective_from = max(from_slot, now_slot)
@@ -439,9 +409,8 @@ def replan(
     locked, so a replan can never rewrite the past.
 
     `priority_overrides` carries the coordinator's exceptions to the tier
-    default (guide section 4, question 2). They belong here rather than in the
-    dataset because they are a decision about THIS fix — which company must
-    survive this particular squeeze — not a standing property of the company.
+    default. They belong here rather than in the dataset: they are a decision
+    about this fix, not a standing property of the company.
     """
     if isinstance(disruptions, dict):
         disruptions = [disruptions]
@@ -466,11 +435,9 @@ def replan(
             iid for iid, a in prior_schedule.items() if a["start"] < now_slot
         }
 
-    # A disruption can contradict the past: dropping a panel that already ran
-    # interviews, or making a company unavailable at an hour it has already
-    # interviewed in. The solver reports that as a bare INFEASIBLE, which tells
-    # a coordinator nothing. Check the locked set against the post-disruption
-    # constraints first and name the actual conflict.
+    # A disruption can contradict the past — dropping a panel that already ran
+    # interviews, say. The solver would report that as a bare INFEASIBLE, so
+    # check the locked set first and name the actual conflict.
     lock_conflicts = _validate_locks(working, prior_schedule, locked)
     if lock_conflicts:
         return {
@@ -494,9 +461,7 @@ def replan(
         with_report=True, priority_overrides=priority_overrides,
     )
     if attempt is None:
-        # Distinguish "proved impossible" from "ran out of time". Reporting a
-        # timeout as infeasibility is the same failure the spec warns about,
-        # inverted: a confident, specific, wrong answer.
+        # "Proved impossible" and "ran out of time" are different answers.
         timed_out = _last_report.get("timed_out")
         return {
             "ok": False,
@@ -534,11 +499,9 @@ def replan(
             )
             base = proposal["diff"]["elective_churn_count"]
             reduced = alt["diff"]["elective_churn_count"]
-            # Only offer the alternative if it is meaningfully cheaper.
-            # Sometimes the churn is simply irreducible -- the displaced
-            # interviews cannot stay where they were at any penalty weight --
-            # and showing a coordinator two near-identical options as though
-            # they were a choice is worse than telling them there isn't one.
+            # Only offer the alternative if it is meaningfully cheaper —
+            # sometimes the churn is irreducible at any penalty weight, and
+            # two near-identical options are not a choice.
             if reduced < base * 0.9:
                 alt["label"] = "minimal-churn alternative"
                 proposal["label"] = "best-coverage proposal"
@@ -566,10 +529,9 @@ def replan(
 def _validate_locks(working, prior_schedule, locked):
     """Check already-completed interviews against the post-disruption rules.
 
-    Returns human-readable conflicts. These are cases where the disruption is
-    retroactively impossible rather than merely hard, and the distinction
-    matters to a coordinator: no amount of extra solver time will help, but
-    re-issuing the event from a later moment will.
+    Returns human-readable conflicts: cases where the disruption is
+    retroactively impossible rather than merely hard, so extra solver time
+    will not help but re-issuing the event from a later moment will.
     """
     if not locked:
         return []
@@ -587,11 +549,8 @@ def _validate_locks(working, prior_schedule, locked):
         company = companies.get(cid)
         if not company:
             continue
-        # Capacity is checked at each already-run moment rather than against a
-        # single week-wide peak, because a blackout removes a panel from one
-        # part of the week only. A blackout laid over an hour the company has
-        # already interviewed in is just as contradictory as cutting its panel
-        # count, and used to reach the solver as a bare INFEASIBLE.
+        # Checked at each already-run moment rather than against a week-wide
+        # peak, because a blackout removes a panel from part of the week only.
         worst = None
         for probe in items:
             at = probe["start"]
@@ -658,18 +617,16 @@ def _build_proposal(working, prior_scheduled, attempt, applied, churn_cap_pct,
                     forced_removed=(), original_names=None):
     diff = compute_diff(prior_scheduled, attempt["scheduled"], forced_removed)
     errors = attempt["model"].verify_schedule(attempt["scheduled"])
-    # The cap governs ELECTIVE churn only. Cancelling a withdrawn student's
-    # interviews is the disruption, not the fix — charging it against the cap
-    # would fire the authorization prompt on events the coordinator has no
-    # choice about, and would make "reduce churn" mean "un-withdraw them".
+    # The cap governs elective churn only: cancelling a withdrawn student's
+    # interviews is the disruption, not the fix.
     cap_exceeded = diff["elective_churn_pct"] > churn_cap_pct
 
     return {
         "ok": True,
         "label": "proposal",
-        # The amended problem input travels WITH the proposal. Applying a
-        # roster change that persisted only the schedule would leave
-        # appointments pointing at a company the dataset no longer contains.
+        # The amended problem input travels with the proposal, or applying a
+        # roster change would leave appointments pointing at a company the
+        # dataset no longer contains.
         "dataset": working,
         "disruptions_applied": applied,
         "solver": attempt["report"],
@@ -682,9 +639,8 @@ def _build_proposal(working, prior_scheduled, attempt, applied, churn_cap_pct,
         "verification_errors": errors,
         "churn_cap_pct": churn_cap_pct,
         "cap_exceeded": cap_exceeded,
-        # Stated without a remedy: whether a cheaper fix actually exists is
-        # not known until the retry has run, and promising an alternative
-        # that never materialises is worse than saying nothing.
+        # Stated without a remedy: whether a cheaper fix exists is unknown
+        # until the retry has run. `replan` appends the outcome.
         "authorization_prompt": (
             f"This fix requires moving {diff['elective_churn_count']} "
             f"appointments the disruption did not itself cancel "
@@ -699,15 +655,11 @@ def _build_proposal(working, prior_scheduled, attempt, applied, churn_cap_pct,
 def compute_diff(old_schedule, new_schedule, forced_removed=()):
     """Structured diff between two schedules, with the affected parties.
 
-    Churn is split two ways. FORCED churn is what the disruption removed
-    outright (a withdrawn student's interviews); ELECTIVE churn is what the
-    replanner chose to move or drop in order to absorb it. Only elective churn
-    is meaningful to cap: it is the "moving 200 appointments to fix a 2-hour
-    delay" the spec warns about. Reporting one blended number both hides the
-    real cost of the fix and trips the cap on events nobody chose.
-
-    Kept a pure function of (old, new) so it is independently testable and
-    reusable by both the API and the dashboard (guide section 8).
+    Churn is split two ways: forced churn is what the disruption removed
+    outright (a withdrawn student's interviews), elective churn is what the
+    replanner chose to move or drop to absorb it. Only elective churn is
+    meaningful to cap — one blended number hides the real cost of the fix and
+    trips the cap on events nobody chose.
     """
     forced_removed = set(forced_removed)
     churn = compute_churn(old_schedule, new_schedule)
@@ -721,9 +673,8 @@ def compute_diff(old_schedule, new_schedule, forced_removed=()):
             "id": iid,
             "company_id": rec["company_id"],
             "student_id": rec["student_id"],
-            # Enough for the board to draw a NEWLY placed interview. Without
-            # these the dashboard can name an addition but cannot position it,
-            # so a proposal that adds interviews previews as nothing at all.
+            # Enough for the board to draw a newly placed interview, not just
+            # name it.
             "duration_slots": rec["duration_slots"],
             "tier": rec["tier"],
         }
@@ -768,19 +719,13 @@ def compute_diff(old_schedule, new_schedule, forced_removed=()):
 
 
 def compute_notify_list(diff, dataset, extra_names=None):
-    """Who needs to be told what — generated straight from the diff.
+    """Who needs to be told what, derived from the diff and the roster.
 
-    Takes only the diff and the roster: it used to also accept the old and new
-    schedules and read neither, which is exactly what "generated straight from
-    the diff" means.
-
-    Explicitly requested by the spec and easy to forget (guide section 5,
-    item 5). One entry per person, not per changed interview, so a student
-    with three moved interviews gets one message rather than three.
+    One entry per person rather than per changed interview, so a student with
+    three moved interviews gets one message.
     """
     # A withdrawn company is gone from the amended dataset, but its cancelled
-    # interviews still need naming in the messages that go out — so fall back
-    # to the pre-amendment names before the bare id.
+    # interviews still need naming, so fall back to the pre-amendment names.
     names = dict(extra_names or {})
     names.update({c["id"]: c["name"] for c in dataset["companies"]})
 
@@ -845,8 +790,8 @@ def compute_notify_list(diff, dataset, extra_names=None):
 def apply_proposal(proposal):
     """Commit a proposal the coordinator accepted.
 
-    Deliberately separate from `replan` so a schedule can never change as a
-    side effect of asking what a fix would cost.
+    Separate from `replan` so a schedule never changes as a side effect of
+    asking what a fix would cost.
     """
     if not proposal.get("ok"):
         raise ValueError("cannot apply a failed replan")

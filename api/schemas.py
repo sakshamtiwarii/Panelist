@@ -1,4 +1,4 @@
-"""Panelist — request bodies for the API. Response shapes stay plain dicts."""
+"""Request bodies for the API. Response shapes stay plain dicts."""
 
 from typing import Dict, List, Literal, Optional
 
@@ -6,9 +6,8 @@ from pydantic import BaseModel, Field
 
 from api.deps import DEFAULT_DATASET
 
-# The coordinator's exceptions to the tier default, as company_id -> level.
-# A Literal rather than a bare str so an unknown level is a 422 naming the
-# valid ones, instead of an override that is silently ignored by the solver.
+# company_id -> level. A Literal rather than a bare str, so an unknown level
+# is a 422 naming the valid ones instead of an override the solver ignores.
 PriorityOverrides = Dict[str, Literal["protect", "normal", "deprioritise"]]
 
 
@@ -88,7 +87,6 @@ class ReplanRequest(BaseModel):
 
 class ApplyRequest(BaseModel):
     proposal_id: str
-    # When the first fix blew the churn cap, the replanner also solved for a
-    # lower-churn one. Committing that instead is the "or let me search for a
-    # looser fix" half of the guide's authorization flow.
+    # Commit the lower-churn alternative the replanner solved for when the
+    # first fix blew the churn cap.
     use_alternative: bool = False

@@ -1,16 +1,7 @@
-"""
-Panelist — schedule quality metrics (guide section 3).
+"""Schedule quality metrics, computed after every schedule and replan run.
 
-Computed after every schedule/replan run:
-- % of interviews successfully scheduled
-- student clash count (should be 0 by construction; report as sanity check)
-- room utilization (%, per room and aggregate)
-- average student waiting time
-- replan churn (count and % of appointments changed) -- replan runs only
-
-"Good" is defined in the README: zero clashes and CGPA-cutoff compliance are
-non-negotiable and win any trade-off; utilization and wait time are the
-metrics sacrificed first.
+Zero student clashes and CGPA-cutoff compliance are non-negotiable and win any
+trade-off; utilization and wait time are sacrificed first.
 """
 
 from collections import defaultdict
@@ -35,7 +26,7 @@ def compute_metrics(scheduled, unscheduled, rooms, config):
         for r in rooms
     }
 
-    # Student clashes — must be 0; recomputed independently of the solver.
+    # Must be 0; recomputed independently of the solver.
     by_student = defaultdict(list)
     for a in scheduled:
         by_student[a["student_id"]].append(a)

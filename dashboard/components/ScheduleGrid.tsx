@@ -7,13 +7,13 @@ import type { Clock } from "@/lib/time";
 /**
  * Room x time board for one day.
  *
- * A table of appointments would be easier to build and much harder to read.
- * A coordinator's questions are spatial — "what's free at 2pm", "how bad is
- * the 11am crunch", "what does this delay push into" — and a grid answers
- * them without the reader assembling anything in their head.
- *
- * Appointments are absolutely positioned over the cell matrix so an interview
+ * Appointments are absolutely positioned over the cell matrix, so an interview
  * spanning three slots reads as one block rather than three stacked rows.
+ *
+ * Rooms are zebra-striped to keep a column trackable across twenty of them,
+ * lunch gets a row of its own (the usable-slot list omits it, so without one
+ * 12:45 appears to run straight into 14:00), and the current time is drawn as
+ * a labelled rule.
  */
 
 export type ChangeState = "moved" | "added" | "cut" | null;
@@ -32,23 +32,27 @@ interface Props {
   roomFilter: string | null;
   /** Dim everything except one company. Null dims nothing. */
   companyFilter: string | null;
-  /** Per-room utilisation %, keyed by room id (guide section 3). */
+  /** Per-room utilisation %, keyed by room id. */
   roomUtilisation?: Record<string, number>;
+  /** Geometry, so the toolbar's density switch reaches the absolutely
+      positioned blocks as well as the CSS grid. If the two disagree, every
+      block floats off its cell. */
+  rowH: number;
+  colW: number;
+  gutter: number;
 }
 
-const ROW_H = 27;
-const COL_W = 78;
-const GUTTER = 62;
-const HEAD_H = 30;
+const HEAD_H = 34;
+const BREAK_H = 20;
 
-// Status carries a glyph as well as a hue, so a change stays readable in
-// greyscale and to colour-blind readers (the palette rule: never colour alone).
-const MARK: Record<string, string> = { moved: "\u21C5", added: "+", cut: "\u00D7" };
+// A glyph as well as a hue, so a change stays readable in greyscale.
+const MARK: Record<string, string> = { moved: "⇅", added: "+", cut: "×" };
 
 export default function ScheduleGrid({
   day, cfg, clock, appointments, companyName,
   changeState, lockedBefore, focusStudent, onPick,
   roomFilter, companyFilter, roomUtilisation,
+  rowH, colW, gutter,
 }: Props) {
   const rooms = useMemo(
     () => (roomFilter ? cfg.rooms.filter((r) => r.id === roomFilter) : cfg.rooms),
@@ -89,12 +93,45 @@ export default function ScheduleGrid({
     return s;
   }, [rooms, day]);
 
+  // The last row before the slot numbers jump — that gap is lunch. Null when
+  // the day happens to have no break at all.
+  const breakAfter = useMemo(() => {
+    for (let i = 1; i < slots.length; i++) {
+      if (slots[i] !== slots[i - 1] + 1) return i - 1;
+    }
+    return null;
+  }, [slots]);
+
+  /* Two coordinate systems have to agree: CSS grid lines for the cells, pixel
+     offsets for the absolutely positioned blocks. Both derive from `past` so a
+     lunch row cannot shift one without the other. */
+  const past = (row: number) => breakAfter !== null && row > breakAfter;
+  const gridRowOf = (row: number) => row + 2 + (past(row) ? 1 : 0);
+  const yOf = (row: number) => HEAD_H + row * rowH + (past(row) ? BREAK_H : 0);
+
+  const templateRows = breakAfter === null
+    ? `${HEAD_H}px repeat(${slots.length}, ${rowH}px)`
+    : `${HEAD_H}px repeat(${breakAfter + 1}, ${rowH}px) ${BREAK_H}px `
+      + `repeat(${slots.length - breakAfter - 1}, ${rowH}px)`;
+
+  // Where "now" falls among the visible rows: the first row that has not
+  // started yet. Off-day and off-board values simply do not draw.
+  const nowRow = useMemo(() => {
+    if (lockedBefore === null) return null;
+    if (clock.dayOf(lockedBefore) !== day) return null;
+    const s = clock.slotOf(lockedBefore);
+    let row = 0;
+    for (let i = 0; i < slots.length; i++) if (slots[i] <= s) row = i + 1;
+    return row > 0 && row < slots.length ? row : null;
+  }, [lockedBefore, day, clock, slots]);
+
   const onThisDay = appointments.filter((a) => a.day === day);
   const todays = onThisDay.filter((a) => a.room);
-  // An interview with no room cannot be placed on a room x time grid, but
-  // dropping it from the view made a real failure invisible: the schedule
-  // showed fine while some interviews had nowhere to happen.
+  // An interview with no room cannot be drawn on a room x time grid, but
+  // dropping it silently would hide a real hard-constraint failure.
   const roomless = onThisDay.length - todays.length;
+
+  const gridW = gutter + rooms.length * colW;
 
   return (
     <div className="grid-scroll">
@@ -108,8 +145,8 @@ export default function ScheduleGrid({
       <div
         className="grid"
         style={{
-          gridTemplateColumns: `${GUTTER}px repeat(${rooms.length}, ${COL_W}px)`,
-          gridTemplateRows: `${HEAD_H}px repeat(${slots.length}, ${ROW_H}px)`,
+          gridTemplateColumns: `${gutter}px repeat(${rooms.length}, ${colW}px)`,
+          gridTemplateRows: templateRows,
         }}
       >
         <div className="grid-corner" />
@@ -126,7 +163,10 @@ export default function ScheduleGrid({
               {r.name.replace(/^Room /, "R")}
               {util !== undefined && (
                 <span className="util" aria-hidden>
-                  <span style={{ width: `${Math.min(100, util)}%` }} />
+                  <span
+                    className={util >= 92 ? "hot" : undefined}
+                    style={{ width: `${Math.min(100, Math.max(3, util))}%` }}
+                  />
                 </span>
               )}
             </div>
@@ -137,12 +177,29 @@ export default function ScheduleGrid({
           <TimeRow
             key={s}
             slot={s}
-            row={row}
+            gridRow={gridRowOf(row)}
             rooms={rooms}
             clock={clock}
             blockedCells={blockedCells}
           />
         ))}
+
+        {breakAfter !== null && (
+          <div
+            className="grid-break"
+            style={{ gridRow: breakAfter + 3, gridColumn: `1 / -1` }}
+          >
+            <span>Lunch · {cfg.config.lunch[0]}–{cfg.config.lunch[1]}</span>
+          </div>
+        )}
+
+        {nowRow !== null && (
+          <div
+            className="grid-now"
+            style={{ top: yOf(nowRow) - 1, left: gutter, width: gridW - gutter }}
+            title="Interviews above this line have already happened and will not be moved"
+          />
+        )}
 
         {todays.map((a) => {
           const row = rowOf.get(a.slot);
@@ -151,13 +208,19 @@ export default function ScheduleGrid({
 
           // Duration can run past lunch in row terms; clamp to the visible run.
           const endRow = rowOf.get(a.slot + a.duration_slots - 1) ?? row;
-          const span = Math.max(1, endRow - row + 1);
           const state = changeState(a.id);
           const locked =
             lockedBefore !== null && clock.abs(a.day, a.slot) < lockedBefore;
+          const focused = focusStudent !== null && a.student_id === focusStudent;
           const dim =
-            (focusStudent !== null && a.student_id !== focusStudent) ||
+            (focusStudent !== null && !focused) ||
             (companyFilter !== null && a.company_id !== companyFilter);
+
+          const top = yOf(row);
+          // Measured to the END of the last row rather than multiplied out, so
+          // an interview that straddles lunch grows over the break instead of
+          // ending an hour early.
+          const height = Math.max(rowH, yOf(endRow) + rowH - top) - 3;
 
           return (
             <button
@@ -168,25 +231,32 @@ export default function ScheduleGrid({
                 state ? `is-${state}` : "",
                 locked ? "is-locked" : "",
                 dim ? "dimmed" : "",
+                focused ? "focused" : "",
               ].filter(Boolean).join(" ")}
               style={{
-                top: HEAD_H + row * ROW_H + 1,
-                left: GUTTER + col * COL_W + 1,
-                width: COL_W - 3,
-                height: span * ROW_H - 3,
+                top: top + 1,
+                left: gutter + col * colW + 1,
+                width: colW - 3,
+                height,
               }}
               onClick={() => onPick(a)}
               title={[
                 companyName(a.company_id),
-                a.student_id,
-                `${clock.label(a.slot)}–${clock.label(a.slot + a.duration_slots)}`,
+                `Student ${a.student_id}`,
+                `${clock.label(a.slot)}–${clock.label(a.slot + a.duration_slots)}`
+                  + ` · ${clock.minutes(a.duration_slots)} min`,
                 `${a.room} · panel ${a.panel}`,
-                locked ? "already under way — locked" : "",
+                locked ? "Already under way — locked" : "",
+                state === "moved" ? "Proposal: moves to this slot" : "",
+                state === "added" ? "Proposal: newly placed here" : "",
+                state === "cut" ? "Proposal: cancelled" : "",
               ].filter(Boolean).join("\n")}
             >
               {state && <span className="mark">{MARK[state]}</span>}
               <span className="co">{shortName(companyName(a.company_id))}</span>
-              {span > 1 && <span className="st">{a.student_id}</span>}
+              {/* Two text lines need 32px: 4px padding plus a 15px and a 13px
+                  line box. Below that only the company name fits. */}
+              {height >= 32 && <span className="st">{a.student_id}</span>}
             </button>
           );
         })}
@@ -196,9 +266,9 @@ export default function ScheduleGrid({
 }
 
 function TimeRow({
-  slot, row, rooms, clock, blockedCells,
+  slot, gridRow, rooms, clock, blockedCells,
 }: {
-  slot: number; row: number; rooms: Room[]; clock: Clock;
+  slot: number; gridRow: number; rooms: Room[]; clock: Clock;
   blockedCells: Set<string>;
 }) {
   const hour = clock.isHour(slot);
@@ -206,7 +276,7 @@ function TimeRow({
     <>
       <div
         className={`grid-time${hour ? " hour" : ""}`}
-        style={{ gridRow: row + 2, gridColumn: 1 }}
+        style={{ gridRow, gridColumn: 1 }}
       >
         {hour ? clock.label(slot) : ""}
       </div>
@@ -215,10 +285,11 @@ function TimeRow({
           key={r.id}
           className={[
             "grid-cell",
+            i % 2 === 1 ? "odd" : "",
             hour ? "hour" : "",
             blockedCells.has(`${r.id}:${slot}`) ? "blocked" : "",
           ].filter(Boolean).join(" ")}
-          style={{ gridRow: row + 2, gridColumn: i + 2 }}
+          style={{ gridRow, gridColumn: i + 2 }}
         />
       ))}
     </>
@@ -231,10 +302,9 @@ function blockedReason(room: Room, day: number) {
 }
 
 /**
- * Company names are already short. A 78px cell fits roughly twelve characters,
- * so the few long ones get a known abbreviation rather than a mid-word ellipsis
- * ("Tech Mahin…"); anything unlisted falls through to CSS truncation, with the
- * full name always in the block's tooltip.
+ * A cell fits roughly twelve characters, so the few long names get a known
+ * abbreviation rather than a mid-word ellipsis. Anything unlisted falls through
+ * to CSS truncation; the full name is always in the block's tooltip.
  */
 const ABBREV: Record<string, string> = {
   "Tech Mahindra": "TechM",

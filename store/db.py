@@ -1,17 +1,12 @@
-"""
-Panelist — schedule persistence.
+"""Schedule persistence.
 
 Two stores implement one interface. `PostgresStore` is the real one: versioned
 schedules, a replan audit trail, and impact queries answered by SQL joins
-rather than by loading the week into Python. `MemoryStore` is the fallback.
+rather than by loading the week into Python.
 
-Why a fallback exists
----------------------
-The demo must never be hostage to infrastructure. If DATABASE_URL is unset or
-Postgres is unreachable, the API logs it once and keeps working in memory —
-a coordinator mid-disruption should not lose the schedule because a container
-died, and a live defense should not open with a connection error. `GET /health`
-reports which store is active, so the degradation is visible rather than silent.
+`MemoryStore` is the fallback used when DATABASE_URL is unset or Postgres is
+unreachable, so a coordinator mid-disruption does not lose the schedule to a
+dead container. `GET /health` reports which store is active.
 """
 
 import contextlib
@@ -29,16 +24,14 @@ SCHEMA_PATH = pathlib.Path(__file__).with_name("schema.sql")
 def open_store(url=None, quiet=False, attempts=10, delay=1.5):
     """Return a Postgres-backed store, or an in-memory one if unavailable.
 
-    Retries before giving up: a database that is merely still booting is the
-    common case on a cold start, and falling back to memory there would drop
-    persistence for the whole run while every request still succeeded.
+    Retries before giving up, since a database still booting is the common
+    case on a cold start.
     """
     url = url or os.environ.get("DATABASE_URL")
-    # The in-memory fallback keeps a single long-lived process serving when the
-    # database is down. On serverless it does the opposite: every instance gets
-    # its own empty store, so a schedule appears and vanishes depending on
-    # which one answers. PANELIST_REQUIRE_DB=1 makes an unreachable database a
-    # startup failure instead — visible, rather than quietly incoherent.
+    # The memory fallback keeps one long-lived process serving while the
+    # database is down, but on serverless every instance gets its own empty
+    # store. PANELIST_REQUIRE_DB=1 makes an unreachable database a startup
+    # failure instead.
     require_db = os.environ.get("PANELIST_REQUIRE_DB") == "1"
     if not url:
         if require_db:
@@ -126,12 +119,7 @@ class MemoryStore:
         return versions[-1] if versions else None
 
     def versions(self, dataset):
-        """Newest first, with the same keys PostgresStore returns.
-
-        The shape and the order are part of the API contract, not an accident
-        of how each store happens to hold its rows: /schedule/versions must not
-        answer differently depending on whether the database was reachable.
-        """
+        """Newest first, with the same keys PostgresStore returns."""
         versions = self._schedules.get(dataset, [])
         return [{
             "version": e["version"],
@@ -147,12 +135,7 @@ class MemoryStore:
         return versions[-1]["version"] if versions else None
 
     def current_dataset(self):
-        """The most recently solved dataset, or None.
-
-        Returning "the first one that has a schedule" made the answer depend on
-        insertion order the moment a second dataset existed — which a demo-seeded
-        deployment reaches as soon as anyone solves a different one.
-        """
+        """The most recently solved dataset, or None."""
         live = [(v[-1]["created_at"], v[-1]["version"], name)
                 for name, v in self._schedules.items() if v]
         return max(live)[2] if live else None
@@ -160,10 +143,9 @@ class MemoryStore:
     # -- replan audit ----------------------------------------------------
     def record_replan(self, dataset, disruptions, proposal, to_version):
         d = proposal["diff"]
-        # `disruptions` is accepted and not stored: PostgresStore keeps it as
-        # forensics in a column nothing reads back, and inventing a key here
-        # that the other store cannot produce is what put the two shapes out
-        # of step in the first place.
+        # `disruptions` is accepted and not stored: PostgresStore keeps it in
+        # a forensics column nothing reads back, so there is no key for it in
+        # the shared row shape.
         self._replans.setdefault(dataset, []).append({
             "applied_at": datetime.datetime.now(datetime.timezone.utc),
             "descriptions": proposal["disruptions_applied"],
@@ -176,11 +158,7 @@ class MemoryStore:
         })
 
     def replan_history(self, dataset, limit=20):
-        """Newest first, with the same keys PostgresStore returns.
-
-        Same contract as `versions`: /replan/history must not answer
-        differently depending on whether the database was reachable.
-        """
+        """Newest first, with the same keys PostgresStore returns."""
         rows = list(reversed(self._replans.get(dataset, [])))[:limit]
         return [{**e, "applied_at": e["applied_at"].isoformat()} for e in rows]
 
@@ -201,10 +179,8 @@ class MemoryStore:
     def clear_proposals(self, dataset):
         """Drop this dataset's pending proposals, and any expired ones.
 
-        The expired half matches PostgresStore's "OR expires_at <= now()":
-        without it a long-lived process accumulates proposals for datasets it
-        has moved on from, which `get_proposal` only ever clears if something
-        happens to ask for them by id again.
+        The expired half matches PostgresStore's "OR expires_at <= now()", and
+        stops a long-lived process accumulating proposals nothing asks for.
         """
         now = time.time()
         for pid, row in list(self._proposals.items()):
@@ -245,10 +221,8 @@ class MemoryStore:
 
         out = []
         for sid, mine in by_student.items():
-            # "That day" means the days this student was actually hit on, not
-            # the whole week. With no day filter the old code counted every
-            # interview they had all week, which answers a different question
-            # than the column name — and a different one than the SQL store.
+            # "That day" means the days this student was hit on, not the whole
+            # week — same as the SQL store.
             hit_days = {a["day"] for a in mine}
             same_day = sum(
                 1 for a in rows
@@ -283,12 +257,8 @@ class PostgresStore:
         """A transaction with exclusive use of the single connection.
 
         FastAPI runs sync endpoints in a threadpool, so concurrent requests
-        share this store — and the dashboard deliberately fires /schedule and
-        /metrics together. A psycopg2 connection is not safe for concurrent
-        transactions and `with conn` is not reentrant, so without this the
-        second thread dies with "the connection cannot be re-entered
-        recursively" while the first succeeds: an error that appears only
-        under real concurrency, and never in a sequential test.
+        share this store, and a psycopg2 connection is neither safe for
+        concurrent transactions nor reentrant under `with conn`.
         """
         with self._lock, self.conn, self.conn.cursor() as cur:
             yield cur
@@ -310,8 +280,11 @@ class PostgresStore:
 
     # -- datasets --------------------------------------------------------
     def put_dataset(self, name, ds):
-        """Replace a dataset wholesale. Cascades wipe dependent schedules,
-        which is correct: a schedule for different input data is meaningless."""
+        """Replace a dataset wholesale.
+
+        Cascades wipe dependent schedules: a schedule for different input data
+        is meaningless.
+        """
         with self._tx() as cur:
             cur.execute("DELETE FROM datasets WHERE name = %s", (name,))
             cur.execute(
@@ -319,10 +292,8 @@ class PostgresStore:
                 (name, ds["meta"]["seed"], json.dumps(ds["config"])),
             )
             # The disruption columns are written here as well as in
-            # amend_dataset. They default to '[]', so omitting them silently
-            # dropped a company's lateness windows and panel blackouts on any
-            # dataset that already carried them — and MemoryStore, which keeps
-            # the dict as given, disagreed with Postgres about the same input.
+            # amend_dataset: they default to '[]', so omitting them drops a
+            # company's lateness windows and panel blackouts.
             cur.executemany(
                 """INSERT INTO companies (dataset, id, name, tier, cgpa_cutoff,
                        panel_count, interview_minutes, duration_slots,
@@ -411,14 +382,13 @@ class PostgresStore:
         }
 
     def amend_dataset(self, name, ds):
-        """Apply a roster change WITHOUT cascading away schedule history.
+        """Apply a roster change without cascading away schedule history.
 
-        `put_dataset` deletes and reinserts, which is right when the input data
-        is genuinely replaced — but a roster amendment must keep prior schedule
-        versions and the replan audit trail intact, so this upserts instead.
-        Historical appointments keep their rows because `appointments.company_id`
-        is deliberately not a foreign key: a past schedule should still record
-        what it scheduled, even for a company that has since pulled out.
+        `put_dataset` deletes and reinserts; a roster amendment must keep prior
+        schedule versions and the replan audit trail, so this upserts.
+        `appointments.company_id` is deliberately not a foreign key, so a past
+        schedule still records what it scheduled for a company that has since
+        pulled out.
         """
         companies = ds["companies"]
         keep = [c["id"] for c in companies]
@@ -452,8 +422,7 @@ class PostgresStore:
                     "DELETE FROM companies WHERE dataset = %s AND NOT (id = ANY(%s))",
                     (name, keep))
 
-            # Shortlists are replaced wholesale: they are small, and diffing
-            # them would be more code than rewriting them.
+            # Shortlists are small enough to replace wholesale.
             cur.execute("DELETE FROM shortlists WHERE dataset = %s", (name,))
             cur.executemany(
                 "INSERT INTO shortlists (dataset, company_id, student_id) VALUES (%s,%s,%s)",
@@ -551,9 +520,8 @@ class PostgresStore:
     def current_version(self, dataset):
         """Version of the live schedule, or None.
 
-        One indexed row. Exists so a caller can ask "has anything changed"
-        without loading a thousand appointments to find out — which is what
-        checking `get_current()` for the same answer costs.
+        One indexed row, so a caller can poll for "has anything changed"
+        without loading every appointment.
         """
         with self._tx() as cur:
             cur.execute(
@@ -563,11 +531,7 @@ class PostgresStore:
         return row[0] if row else None
 
     def current_dataset(self):
-        """The dataset that has a live schedule, or None.
-
-        Lets a freshly-started worker find the current dataset instead of
-        depending on having served the request that solved it.
-        """
+        """The dataset that has a live schedule, or None."""
         with self._tx() as cur:
             # Newest first: `is_current` is per dataset, so several can carry
             # one at once and an unordered LIMIT 1 picks arbitrarily.
@@ -585,9 +549,8 @@ class PostgresStore:
                 (dataset, to_version))
             row = cur.fetchone()
             to_id = row[0] if row else None
-            # The version this replan built on. Clamping to 1 would make the
-            # first row claim it went from v1 to v1; there is simply no prior
-            # schedule to point at in that case.
+            # The version this replan built on. Left null for the first, which
+            # has no prior schedule to point at.
             from_id = None
             if to_version > 1:
                 cur.execute(
@@ -689,12 +652,7 @@ class PostgresStore:
 
     # -- impact ----------------------------------------------------------
     def affected(self, dataset, company_id=None, room=None, day=None):
-        """Who a disruption touches, and what else they have that day.
-
-        This is the query the guide names as the reason to have a database:
-        the second column is a correlated count over the same student's other
-        interviews, which is a join, not a lookup.
-        """
+        """Who a disruption touches, and what else they have that day."""
         clauses, params = ["s.dataset = %s", "s.is_current"], [dataset]
         if company_id:
             clauses.append("a.company_id = %s")
@@ -714,9 +672,9 @@ class PostgresStore:
                 WHERE {' AND '.join(clauses)}
                 GROUP BY a.schedule_id, a.student_id, a.day
             ),
-            -- Per (student, day) hit: what ELSE that student has that same
-            -- day. Kept as its own step so the correlated count stays scoped
-            -- to the day, while the final grouping is per student.
+            -- Per (student, day) hit: what else that student has that same
+            -- day. Its own step so the correlated count stays scoped to the
+            -- day while the final grouping is per student.
             per_day AS (
                 SELECT h.student_id, h.n,
                        (SELECT COUNT(*) FROM appointments o
@@ -725,9 +683,7 @@ class PostgresStore:
                            AND o.day         = h.day) - h.n AS others
                 FROM hit h
             )
-            -- One row per student. Grouping by h.day as well used to emit a
-            -- row per student-day, so an unfiltered query reported more
-            -- students affected than there were students.
+            -- One row per student, not per student-day.
             SELECT p.student_id,
                    st.cgpa,
                    SUM(p.n)::int      AS interviews_hit,

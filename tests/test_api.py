@@ -1,14 +1,8 @@
-"""
-Panelist — API contract tests.
+"""API contract tests.
 
-Fast (a small dataset, short solver budgets) and focused on the boundaries the
+Fast (a small dataset, short solver budgets), covering the boundaries the
 replan scenario suite cannot reach: authentication, the role split, and the
 propose/apply handshake.
-
-The propose/apply assertions are the point. Proposing is safe and applying is
-not, so the permission boundary sits at the state change rather than at the
-whole feature — and a proposal must survive in the store between the two calls,
-because a proposal held in process memory is a 404 on any other worker.
 """
 
 import os
@@ -22,9 +16,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 @pytest.fixture(scope="module")
 def client(tmp_path_factory):
-    # The suite generates its own dataset rather than reading ./data, which is
-    # gitignored: a fresh clone (and CI) has none, and a test that silently
-    # depends on whatever the developer last generated is not a fixed input.
+    # Generated rather than read from ./data, which is gitignored: a fresh
+    # clone has none, and whatever was last generated is not a fixed input.
     from generator.generate import build_dataset, write_dataset
     data_root = tmp_path_factory.mktemp("data")
     dataset, report = build_dataset(seed=42, companies=6, students=40,
@@ -321,7 +314,7 @@ def test_health_reports_the_version_without_loading_the_schedule(client, solved)
 
 
 def test_metrics_report_utilisation_per_room_and_aggregate(coordinator, solved):
-    """Guide section 3 asks for both; only the aggregate was ever rendered."""
+    """Both per-room and aggregate utilisation are reported."""
     m = coordinator.get("/metrics").json()
     cfg = coordinator.get("/config").json()
     per_room = m["room_utilization_per_room"]

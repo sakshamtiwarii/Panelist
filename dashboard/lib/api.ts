@@ -1,14 +1,14 @@
-// Relative in every environment — next.config.mjs supplies "/api" and the
-// route handler behind it forwards to the solver. Absolute only when someone
-// deliberately points the console at an API directly.
+// Relative in every environment: next.config.mjs supplies "/api" and the route
+// handler behind it forwards to the solver. Absolute only to deliberately point
+// the console at an API directly.
 const BASE = process.env.NEXT_PUBLIC_API_URL || "/api";
 
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     ...init,
     headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
-    // The session is an httpOnly cookie. Harmless while the call is
-    // same-origin, and required the moment someone points BASE elsewhere.
+    // The session is an httpOnly cookie: a no-op while the call is same-origin,
+    // required the moment BASE points elsewhere.
     credentials: "include",
     cache: "no-store",
   });
@@ -173,7 +173,7 @@ export interface Metrics {
   pct_scheduled: number;
   student_clashes: number;
   room_utilization_pct: number;
-  /** Per room, keyed by room id — the aggregate above is only half of it. */
+  /** Per room, keyed by room id. */
   room_utilization_per_room: Record<string, number>;
   avg_student_wait_minutes: number;
   max_student_wait_minutes: number;
@@ -241,8 +241,8 @@ export interface DisruptionEvent {
 }
 
 /**
- * The coordinator's exceptions to the solver's tier priority, company_id ->
- * level. "normal" is the same as saying nothing; the API strips it.
+ * Exceptions to the solver's tier priority, company_id -> level. "normal" is
+ * the same as saying nothing; the API strips it.
  */
 export type PriorityLevel = "protect" | "normal" | "deprioritise";
 export type PriorityOverrides = Record<string, PriorityLevel>;
