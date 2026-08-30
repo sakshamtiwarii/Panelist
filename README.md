@@ -7,6 +7,9 @@ Sign in as `coordinator` / `placement2026` — both demo accounts are on the
 sign-in screen and fill the form on click. The week is already solved when you
 arrive; nothing to set up.
 
+📄 **[Panelist-User-Guide.pdf](Panelist-User-Guide.pdf)** — a walkthrough of the
+console: what every control does and how to carry out each operation.
+
 ## What this is
 
 A university placement week means hundreds of interviews across a handful of
