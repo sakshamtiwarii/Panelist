@@ -2,14 +2,59 @@
 
 A placement-week scheduling and disruption-replanning system.
 
+**▶ Live console: https://panelist-web-production.up.railway.app**
+Sign in as `coordinator` / `placement2026` — both demo accounts are on the
+sign-in screen and fill the form on click. The week is already solved when you
+arrive; nothing to set up.
+
 ## What this is
 
-Placement week scheduling is a constraint-satisfaction problem that breaks
-constantly: companies run late, panels drop, students withdraw, rooms go
-unavailable. Panelist generates a realistic dataset, produces a feasible
-interview schedule under hard constraints, and — the core of the project —
-replans around live disruptions while disturbing the existing schedule as
-little as possible.
+A university placement week means hundreds of interviews across a handful of
+days: every company has a shortlist, every student may be on several, and no
+student, room or interview panel can be in two places at once. Building that
+timetable is hard. Keeping it valid when the day goes wrong is harder —
+companies run late, interview panels drop out, students accept an offer and go
+home, rooms become unusable.
+
+Panelist does three things:
+
+1. **Generates** a realistic placement week — companies, students, shortlists,
+   rooms — that is deliberately hard to schedule.
+2. **Schedules** it with a constraint solver, guaranteeing no clashes, and
+   explains precisely what is impossible when demand exceeds capacity.
+3. **Replans** around live disruptions while moving as few already-scheduled
+   interviews as possible — and always as a *proposal* a coordinator reviews
+   and approves, never a silent overwrite.
+
+The third is the heart of the project. A replan that fixes a two-hour delay by
+reshuffling half the week is not a fix; the cost of the fix is itself a
+first-class output.
+
+### Try it in two minutes
+
+On the [live console](https://panelist-web-production.up.railway.app), signed
+in as the coordinator:
+
+1. The board is the week — rooms across the top, time down the side, one block
+   per interview, coloured by company tier.
+2. In the left rail pick **Running late**, choose *TCS*, **Day 4**, 3 hours,
+   and **Add this event**.
+3. Press **Find a fix**. Nothing has changed yet — you get a *proposal*: how
+   many interviews it moves, whether that is within your limit, and who needs
+   telling. The board previews every move in amber behind it.
+4. **Apply this fix** to commit it, or **Discard**. The version history and
+   audit trail below the rail record what changed and what it cost.
+
+### Contents
+
+**Using it** · [Running it locally](#running-it) · [The dashboard](#dashboard) ·
+[Signing in](#signing-in) · [Deploying it](#deploying-it)
+**How it works** · [Architecture](#architecture) ·
+[Solver results](#solver-results) · [Replanning](#replanning) ·
+[Datasets](#datasets) · [Persistence](#persistence) ·
+[Roster changes](#roster-changes) · [API](#api)
+**Why it works this way** · [Design decisions](#design-decisions) ·
+[Tests](#tests)
 
 ## Architecture
 
@@ -135,55 +180,6 @@ rather than silent — a live demo should not open with a connection error.
 On startup the API adopts any schedule that outlived the last process, so a
 restart comes back with the week already planned rather than needing a re-solve.
 
-## Deploying it
-
-Two pieces: a Next.js console and a Python solver — the solver being a
-long-running process carrying a 70 MB OR-Tools binary, which is what decides
-where this is comfortable to host.
-
-**Deployed on Railway.** The point of hosting this at all is that a reviewer
-opens a link and the console is *already there*, so a platform that sleeps its
-free tier and takes a minute to wake would defeat the exercise. Railway only
-sleeps a service if you turn its Serverless feature on. The $5 trial credit
-covers a 30-day review window; after that it is the $5/month Hobby plan, since
-the Free plan's $1/month credit will not keep a service up.
-
-**New Project → Deploy from GitHub repo**, then add three services in one
-project:
-
-| Service | Setting |
-|---|---|
-| Postgres | Add from Railway's Postgres template |
-| API | Root Directory `/`, Dockerfile Path `api/Dockerfile` |
-| Console | Root Directory `dashboard` — auto-detected as Next.js |
-
-On the **API** service:
-
-```
-DATABASE_URL          ${{Postgres.DATABASE_URL}}
-PANELIST_SECRET_KEY   any long random string
-PANELIST_REQUIRE_DB   1
-PANELIST_COOKIE_SECURE 1
-```
-
-On the **Console** service, one variable pointing at the API:
-
-```
-PANELIST_API_ORIGIN   https://<your-api>.up.railway.app
-```
-
-Generate a public domain for the console. The API needs one too on this path,
-since that is what `PANELIST_API_ORIGIN` points at.
-
-You can instead keep the solver off the public internet entirely by pointing
-the console at Railway's private network
-(`http://<api-service>.railway.internal:8000`) and giving it no public domain.
-That network resolves over IPv6, so the API must listen there —
-`PANELIST_HOST=::`. Be aware that this is IPv6-**only**, not dual-stack:
-asyncio does not clear `IPV6_V6ONLY`, so a service bound to `::` refuses IPv4
-outright. Use it only when nothing reaches the API over IPv4, which rules out
-giving it a public domain as well.
-
 ## Running it
 
 ```bash
@@ -303,7 +299,7 @@ To regenerate the dataset with a different seed/size:
 python -m generator.generate --seed 42 --companies 35 --students 800 --rooms 20 --days 4
 ```
 
-## Design decisions (defended)
+## Design decisions
 
 **What does "good" mean?**
 Zero student/room/panel clashes and CGPA-cutoff compliance are treated as
@@ -385,7 +381,7 @@ python -m scheduler.run --data ./data/primary --time-limit 30
 
 | Dataset | Interviews | Status | Time | Scheduled | Clashes | Room util |
 |---|---|---|---|---|---|---|
-| `small` | 114 | OPTIMAL | 0.1s | 100% | 0 | 67% |
+| `small` | 84 | OPTIMAL | 0.1s | 100% | 0 | 50% |
 | `primary` | 1013 | OPTIMAL | 1.2s | 100% | 0 | 90% |
 | `oversubscribed` | 2770 | FEASIBLE (120s cap) | 120s | 39.8% | 0 | 93% |
 
@@ -451,25 +447,79 @@ company, student) · `GET /metrics` · `GET /diagnostics` · `GET /affected` ·
 `GET /schedule/versions` · `POST /replan` · `POST /replan/apply` ·
 `GET /replan/history`
 
-## Status
+## Deploying it
 
-- **Generator** — done. Seeded, reproducible, with conflict-density readout.
-- **Scheduler** — done. CP-SAT model, metrics, capacity diagnostics,
-  independent verification, and coordinator priority overrides on top of the
-  tier default.
-- **Replanner** — done. Four disruption types, compound events, minimal-churn
+Two pieces: a Next.js console and a Python solver — the solver being a
+long-running process carrying a 70 MB OR-Tools binary, which is what decides
+where this is comfortable to host.
+
+**Deployed on Railway.** The point of hosting it is that anyone opens a link
+and the console is *already there*, so a platform that sleeps its free tier and
+takes a minute to wake would defeat the purpose. Railway only
+sleeps a service if you turn its Serverless feature on. The $5 trial credit
+covers a 30-day review window; after that it is the $5/month Hobby plan, since
+the Free plan's $1/month credit will not keep a service up.
+
+**New Project → Deploy from GitHub repo**, then add three services in one
+project:
+
+| Service | Setting |
+|---|---|
+| Postgres | Add from Railway's Postgres template |
+| API | Root Directory `/`, Dockerfile Path `api/Dockerfile` |
+| Console | Root Directory `dashboard` — auto-detected as Next.js |
+
+On the **API** service:
+
+```
+DATABASE_URL          ${{Postgres.DATABASE_URL}}
+PANELIST_SECRET_KEY   any long random string
+PANELIST_REQUIRE_DB   1
+PANELIST_COOKIE_SECURE 1
+```
+
+On the **Console** service, one variable pointing at the API:
+
+```
+PANELIST_API_ORIGIN   https://<your-api>.up.railway.app
+```
+
+Generate a public domain for the console. The API needs one too on this path,
+since that is what `PANELIST_API_ORIGIN` points at.
+
+You can instead keep the solver off the public internet entirely by pointing
+the console at Railway's private network
+(`http://<api-service>.railway.internal:8000`) and giving it no public domain.
+That network resolves over IPv6, so the API must listen there —
+`PANELIST_HOST=::`. Be aware that this is IPv6-**only**, not dual-stack:
+asyncio does not clear `IPV6_V6ONLY`, so a service bound to `::` refuses IPv4
+outright. Use it only when nothing reaches the API over IPv4, which rules out
+giving it a public domain as well.
+
+## What's built
+
+- **Generator** — seeded and reproducible, with a conflict-density readout that
+  proves the instance is hard before any solver runs.
+- **Scheduler** — CP-SAT model, metrics, capacity diagnostics, independent
+  verification, and coordinator priority overrides on top of the tier default.
+- **Replanner** — four disruption types, compound events, minimal-churn
   re-solve, structured diff, notify list, churn cap with authorization flow,
   and a lower-churn alternative the coordinator can commit instead.
-- **API** — done. Propose/apply separation verified end to end.
-- **Persistence** — done. Postgres-backed versioned schedules, impact queries
-  and replan audit trail, with an in-memory fallback.
-- **Auth** — done. Scrypt password hashing, signed httpOnly session cookies,
+- **API** — FastAPI, with propose/apply separation verified end to end.
+- **Persistence** — Postgres-backed versioned schedules, impact queries and a
+  replan audit trail, with an in-memory fallback.
+- **Auth** — scrypt password hashing, signed httpOnly session cookies, and
   coordinator/viewer roles gating mutation.
-- **Roster editing** — done. Add/withdraw a company, edit shortlist entries,
+- **Roster editing** — add or withdraw a company and edit shortlist entries,
   all costed through the replanner rather than written directly.
-- **Dashboard** — done. Next.js coordinator console: board filterable by day,
-  room and company, at-risk view, priority overrides, diff preview with
-  apply/reject (see below).
+- **Dashboard** — Next.js coordinator console: board filterable by day, room
+  and company, at-risk view, priority overrides, and a diff preview with
+  apply/reject.
+
+Not modelled: student time preferences, panel-skill matching (every panel of a
+company is interchangeable), and variable interview lengths within a company.
+Wait time is measured but not optimised — all four fit the existing objective
+as weighted terms.
 
 ## Dashboard
 
@@ -520,7 +570,6 @@ Events are queued rather than fired singly: the compound injection this is
 built for costs far less churn solved once than the same events resolved one
 at a time.
 
-Design bias is the guide's own (§2.4) — clarity over decoration. Colour carries
-meaning and nothing else: neutral is the entire interface, and amber/red/green
-appear only on moved/cancelled/added.
-# Panelist
+Clarity over decoration: colour carries meaning and nothing else. Neutral is
+the entire interface, and amber/red/green appear only on moved, cancelled and
+added interviews.
